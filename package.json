@@ -1,0 +1,6 @@
+{
+  "name": "stenosaurus-js-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test tests/pcm.test.mjs" }
+}

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ status }} · Stenosaurus{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>{{ status }}</h1>
+  <p class="muted">{{ message }}</p>
+  <p><a href="/">Back to dictations</a></p>
+</section>
+{% endblock %}

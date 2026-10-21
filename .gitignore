@@ -1,0 +1,6 @@
+/target
+/data
+/vendor
+/static/vendor
+/node_modules
+.env
