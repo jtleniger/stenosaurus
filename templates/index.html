@@ -1,14 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<header class="bar">
-  <h1>Stenosaurus</h1>
-  <div class="who">
-    <span class="muted">{{ username }}</span>
-    <form method="post" action="/logout">
-      <button type="submit" class="link">Sign out</button>
-    </form>
-  </div>
-</header>
+{% include "header.html" %}
 
 <section class="recorder" aria-label="Dictation">
   <button id="dictate" class="mic" type="button" aria-label="Start dictation">
@@ -25,6 +17,8 @@
   </div>
   <p class="hint">Speech is transcribed in this browser with Whistle. Only the final text is sent to the server.</p>
 </section>
+
+{% include "search_form.html" %}
 
 <section class="dictations">
   <h2>Dictations</h2>

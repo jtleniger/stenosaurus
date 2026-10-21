@@ -6,6 +6,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use regex::{Regex, RegexBuilder};
 use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
@@ -22,6 +23,8 @@ pub const DISPLAY_FORMAT: &[BorrowedFormatItem<'static>] =
 
 const MAX_SEQUENCE: u32 = 1000;
 const PREVIEW_CHARS: usize = 140;
+const SNIPPET_BEFORE_CHARS: usize = 60;
+const SNIPPET_AFTER_CHARS: usize = 120;
 
 /// A dictation as shown in the index list.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -39,6 +42,37 @@ pub struct Dictation {
     pub iso: String,
     pub display: String,
     pub text: String,
+}
+
+/// One run of snippet text, highlighted when it matches the query.
+#[derive(Debug, Clone)]
+pub struct SnippetPart {
+    pub text: String,
+    pub highlight: bool,
+}
+
+/// A dictation matching a search query, with a snippet around the first match.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub id: String,
+    pub iso: String,
+    pub display: String,
+    pub snippet: Vec<SnippetPart>,
+}
+
+/// Search outcome: the total number of matches and the returned page of hits.
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    pub total: usize,
+    pub hits: Vec<SearchHit>,
+}
+
+/// One parsed dictation file, before rendering.
+struct StoredEntry {
+    at: OffsetDateTime,
+    sequence: u32,
+    id: String,
+    text: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,9 +154,9 @@ impl DictationStore {
         Err(StoreError::Exhausted)
     }
 
-    /// All dictations, newest first.
-    pub async fn list(&self) -> Result<Vec<DictationSummary>, StoreError> {
-        let mut entries: Vec<((OffsetDateTime, u32), DictationSummary)> = Vec::new();
+    /// Read and parse every dictation file, newest first.
+    async fn entries(&self) -> Result<Vec<StoredEntry>, StoreError> {
+        let mut entries = Vec::new();
         let mut dir = tokio::fs::read_dir(&self.dir).await?;
         while let Some(entry) = dir.next_entry().await? {
             let path = entry.path();
@@ -135,7 +169,7 @@ impl DictationStore {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Some(key) = parse_id(stem) else {
+            let Some((at, sequence)) = parse_id(stem) else {
                 continue;
             };
             let text = match tokio::fs::read_to_string(&path).await {
@@ -145,19 +179,69 @@ impl DictationStore {
                     continue;
                 }
             };
-            let (_, iso, display) = render(key.0)?;
-            entries.push((
-                key,
-                DictationSummary {
-                    id: stem.to_string(),
+            entries.push(StoredEntry {
+                at,
+                sequence,
+                id: stem.to_string(),
+                text,
+            });
+        }
+        entries.sort_by(|a, b| (b.at, b.sequence).cmp(&(a.at, a.sequence)));
+        Ok(entries)
+    }
+
+    /// All dictations, newest first.
+    pub async fn list(&self) -> Result<Vec<DictationSummary>, StoreError> {
+        let entries = self.entries().await?;
+        let mut summaries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (_, iso, display) = render(entry.at)?;
+            summaries.push(DictationSummary {
+                id: entry.id,
+                iso,
+                display,
+                preview: preview(&entry.text),
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Find dictations containing every whitespace-separated term, newest first.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, StoreError> {
+        let patterns: Vec<Regex> = query
+            .split_whitespace()
+            .map(|term| {
+                RegexBuilder::new(&regex::escape(term))
+                    .case_insensitive(true)
+                    .build()
+                    .expect("escaped literal is always a valid pattern")
+            })
+            .collect();
+        if patterns.is_empty() {
+            return Ok(SearchResults {
+                total: 0,
+                hits: Vec::new(),
+            });
+        }
+
+        let mut total = 0;
+        let mut hits = Vec::new();
+        for entry in self.entries().await? {
+            if !patterns.iter().all(|pattern| pattern.is_match(&entry.text)) {
+                continue;
+            }
+            total += 1;
+            if hits.len() < limit {
+                let (_, iso, display) = render(entry.at)?;
+                hits.push(SearchHit {
+                    id: entry.id,
                     iso,
                     display,
-                    preview: preview(&text),
-                },
-            ));
+                    snippet: snippet(&entry.text, &patterns),
+                });
+            }
         }
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(entries.into_iter().map(|(_, summary)| summary).collect())
+        Ok(SearchResults { total, hits })
     }
 
     /// Load one dictation; invalid or unknown ids are `None`.
@@ -221,6 +305,110 @@ fn preview(text: &str) -> String {
     } else {
         collapsed
     }
+}
+
+/// Window of text around the earliest match, with every query term highlighted.
+fn snippet(text: &str, patterns: &[Regex]) -> Vec<SnippetPart> {
+    let first = patterns
+        .iter()
+        .filter_map(|pattern| pattern.find(text))
+        .min_by_key(|found| found.start())
+        .expect("caller matched at least one pattern");
+    let start = back_chars(text, first.start(), SNIPPET_BEFORE_CHARS);
+    let end = forward_chars(text, first.end(), SNIPPET_AFTER_CHARS);
+    let window = &text[start..end];
+
+    let mut ranges = Vec::new();
+    for pattern in patterns {
+        for found in pattern.find_iter(window) {
+            ranges.push((start + found.start(), start + found.end()));
+        }
+    }
+    ranges.sort_unstable();
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+
+    let mut parts = Vec::new();
+    if start > 0 {
+        parts.push(SnippetPart {
+            text: "… ".to_string(),
+            highlight: false,
+        });
+    }
+    let mut cursor = start;
+    for (s, e) in merged {
+        if s > cursor {
+            parts.push(plain(&text[cursor..s]));
+        }
+        parts.push(SnippetPart {
+            text: flat(&text[s..e]),
+            highlight: true,
+        });
+        cursor = e;
+    }
+    if cursor < end {
+        parts.push(plain(&text[cursor..end]));
+    }
+    if end < text.len() {
+        parts.push(SnippetPart {
+            text: " …".to_string(),
+            highlight: false,
+        });
+    }
+
+    if let Some(first) = parts.first_mut() {
+        if !first.highlight {
+            first.text = first.text.trim_start().to_string();
+        }
+    }
+    if let Some(last) = parts.last_mut() {
+        if !last.highlight {
+            last.text = last.text.trim_end().to_string();
+        }
+    }
+    parts.retain(|part| part.highlight || !part.text.is_empty());
+    parts
+}
+
+fn plain(text: &str) -> SnippetPart {
+    SnippetPart {
+        text: flat(text),
+        highlight: false,
+    }
+}
+
+/// Replace each whitespace character with one space; keeps byte offsets
+/// stable while making the one-line snippet readable.
+fn flat(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect()
+}
+
+/// Byte offset of the character `count` characters before `byte`, or 0.
+fn back_chars(text: &str, byte: usize, count: usize) -> usize {
+    text[..byte]
+        .char_indices()
+        .rev()
+        .take(count)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Byte offset `count` characters after `byte`, or `text.len()`.
+fn forward_chars(text: &str, byte: usize, count: usize) -> usize {
+    text[byte..]
+        .char_indices()
+        .nth(count)
+        .map(|(i, _)| byte + i)
+        .unwrap_or(text.len())
 }
 
 #[cfg(test)]
@@ -348,5 +536,121 @@ mod tests {
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let dir_meta = std::fs::metadata(store.dir()).unwrap();
         assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+    }
+
+    async fn search_terms(store: &DictationStore, query: &str) -> SearchResults {
+        store.search(query, 100).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_matches_all_terms_case_insensitively() {
+        let (_guard, store) = store().await;
+        let older = store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), "Alpha beta gamma")
+            .await
+            .unwrap();
+        let newer = store
+            .save_at(datetime!(2026-10-21 09:15:00 UTC), "alpha only")
+            .await
+            .unwrap();
+
+        let results = search_terms(&store, "ALPHA").await;
+        assert_eq!(results.total, 2);
+        assert_eq!(results.hits[0].id, newer.id);
+        assert_eq!(results.hits[1].id, older.id);
+
+        let results = search_terms(&store, "alpha beta").await;
+        assert_eq!(results.total, 1);
+        assert_eq!(results.hits[0].id, older.id);
+    }
+
+    #[tokio::test]
+    async fn search_is_unicode_case_insensitive() {
+        let (_guard, store) = store().await;
+        store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), "L'école est fermée")
+            .await
+            .unwrap();
+        assert_eq!(search_terms(&store, "ÉCOLE").await.total, 1);
+    }
+
+    #[tokio::test]
+    async fn search_treats_query_as_literal() {
+        let (_guard, store) = store().await;
+        store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), "a.b")
+            .await
+            .unwrap();
+        assert_eq!(search_terms(&store, "a.b").await.total, 1);
+        assert_eq!(search_terms(&store, "axb").await.total, 0);
+        assert_eq!(search_terms(&store, "a.*b").await.total, 0);
+    }
+
+    #[tokio::test]
+    async fn search_reports_highlighted_snippet() {
+        let (_guard, short_store) = store().await;
+        short_store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), "alpha beta gamma")
+            .await
+            .unwrap();
+        let results = search_terms(&short_store, "beta").await;
+        let snippet = &results.hits[0].snippet;
+        let joined: String = snippet.iter().map(|part| part.text.as_str()).collect();
+        assert_eq!(joined, "alpha beta gamma");
+        let highlighted: Vec<&str> = snippet
+            .iter()
+            .filter(|part| part.highlight)
+            .map(|part| part.text.as_str())
+            .collect();
+        assert_eq!(highlighted, ["beta"]);
+
+        let (_long_guard, long_store) = store().await;
+        let long = format!("{}needle{}", "a".repeat(200), "b".repeat(200));
+        long_store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), &long)
+            .await
+            .unwrap();
+        let results = search_terms(&long_store, "needle").await;
+        let snippet = &results.hits[0].snippet;
+        assert_eq!(snippet.first().unwrap().text, "… ");
+        assert!(snippet.last().unwrap().text.ends_with('…'));
+
+        let (_multiline_guard, multiline_store) = store().await;
+        multiline_store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), "alpha\nbeta gamma")
+            .await
+            .unwrap();
+        let results = search_terms(&multiline_store, "beta").await;
+        assert!(results.hits[0]
+            .snippet
+            .iter()
+            .all(|part| !part.text.contains('\n')));
+    }
+
+    #[tokio::test]
+    async fn search_limits_hits_but_counts_all() {
+        let (_guard, store) = store().await;
+        for (at, text) in [
+            (datetime!(2026-10-20 12:00:00 UTC), "match one"),
+            (datetime!(2026-10-20 13:00:00 UTC), "match two"),
+            (datetime!(2026-10-20 14:00:00 UTC), "match three"),
+        ] {
+            store.save_at(at, text).await.unwrap();
+        }
+        let results = store.search("match", 2).await.unwrap();
+        assert_eq!(results.total, 3);
+        assert_eq!(results.hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_with_no_terms_is_empty() {
+        let (_guard, store) = store().await;
+        store
+            .save_at(datetime!(2026-10-20 12:00:00 UTC), "anything")
+            .await
+            .unwrap();
+        let results = store.search("   ", 100).await.unwrap();
+        assert_eq!(results.total, 0);
+        assert!(results.hits.is_empty());
     }
 }

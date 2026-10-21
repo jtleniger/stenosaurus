@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Search · Stenosaurus{% endblock %}
+{% block content %}
+{% include "header.html" %}
+<p class="back"><a href="/">← All dictations</a></p>
+{% include "search_form.html" %}
+{% if empty %}
+<p class="muted">No dictations match “{{ query }}”.</p>
+{% else %}
+<p class="muted result-count">{{ total }} match{% if total != 1 %}es{% endif %}{% if truncated %} · showing the first {{ hits.len() }}{% endif %}</p>
+<ul class="list">
+  {% for hit in hits %}
+  <li>
+    <a href="/dictations/{{ hit.id }}">
+      <time datetime="{{ hit.iso }}" data-local>{{ hit.display }}</time>
+      <span class="preview">{% for part in hit.snippet %}{% if part.highlight %}<mark>{{ part.text }}</mark>{% else %}{{ part.text }}{% endif %}{% endfor %}</span>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

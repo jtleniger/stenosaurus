@@ -266,6 +266,97 @@ async fn transcript_is_html_escaped() {
 }
 
 #[tokio::test]
+async fn search_requires_login() {
+    let app = TestApp::new().await;
+    let response = app
+        .request("GET", "/search?q=hello", None, None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[header::LOCATION], "/login");
+}
+
+#[tokio::test]
+async fn search_finds_and_highlights_dictation() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let saved = save(&app, &cookie, r#"{"text":"hello world"}"#).await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = save(&app, &cookie, r#"{"text":"goodbye"}"#).await;
+    assert_eq!(saved.status(), StatusCode::OK);
+
+    let response = app
+        .request("GET", "/search?q=HELLO", Some(&cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = text(response).await;
+    assert!(body.contains("<mark>hello</mark> world"), "body: {body}");
+    assert!(!body.contains("goodbye"), "body: {body}");
+}
+
+#[tokio::test]
+async fn search_requires_every_term() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    assert_eq!(
+        save(&app, &cookie, r#"{"text":"alpha beta"}"#)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        save(&app, &cookie, r#"{"text":"alpha only"}"#)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let response = app
+        .request("GET", "/search?q=alpha%20beta", Some(&cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = text(response).await;
+    assert!(
+        body.contains("<mark>alpha</mark> <mark>beta</mark>"),
+        "body: {body}"
+    );
+    assert!(!body.contains("only"), "body: {body}");
+}
+
+#[tokio::test]
+async fn search_with_blank_query_redirects_home() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let response = app
+        .request("GET", "/search?q=%20", Some(&cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[header::LOCATION], "/");
+}
+
+#[tokio::test]
+async fn search_escapes_transcript_html() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let saved = app
+        .store
+        .save("<script>alert(1)</script>")
+        .await
+        .unwrap();
+    assert_eq!(saved.text, "<script>alert(1)</script>");
+
+    let response = app
+        .request("GET", "/search?q=alert", Some(&cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = text(response).await;
+    assert!(
+        body.contains("&#60;script&#62;<mark>alert</mark>(1)&#60;/script&#62;"),
+        "body: {body}"
+    );
+    assert!(!body.contains("<script>alert(1)</script>"), "body: {body}");
+}
+
+#[tokio::test]
 async fn unknown_dictation_is_404() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;

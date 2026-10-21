@@ -4,7 +4,7 @@ use askama::Template;
 use askama_web::WebTemplate;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, Request, State};
 use axum::http::header::{self, HeaderValue};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
@@ -21,9 +21,10 @@ use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 use crate::auth::SESSION_KEY;
 use crate::error::{ApiError, PageError};
 use crate::state::AppState;
-use crate::storage::DictationSummary;
+use crate::storage::{DictationSummary, SearchHit};
 
 const MAX_TEXT_CHARS: usize = 200_000;
+const MAX_SEARCH_RESULTS: usize = 100;
 
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
 worker-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self'; \
@@ -35,6 +36,7 @@ struct IndexTemplate {
     username: String,
     dictations: Vec<DictationSummary>,
     empty: bool,
+    query: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -51,10 +53,26 @@ struct DictationTemplate {
     text: String,
 }
 
+#[derive(Template, WebTemplate)]
+#[template(path = "search.html")]
+struct SearchTemplate {
+    username: String,
+    query: String,
+    hits: Vec<SearchHit>,
+    total: usize,
+    empty: bool,
+    truncated: bool,
+}
+
 #[derive(Deserialize)]
 struct LoginForm {
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +147,7 @@ async fn index(
         username,
         dictations,
         empty,
+        query: String::new(),
     })
 }
 
@@ -202,6 +221,37 @@ async fn show_dictation(
         display: dictation.display,
         text: dictation.text,
     })
+}
+
+async fn search(
+    State(state): State<AppState>,
+    AuthedUser(username): AuthedUser,
+    Query(params): Query<SearchParams>,
+) -> Result<Response, PageError> {
+    let query = params.q.unwrap_or_default();
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+    let results = state
+        .store
+        .search(query, MAX_SEARCH_RESULTS)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "could not search dictations");
+            PageError::internal()
+        })?;
+    let truncated = results.total > results.hits.len();
+    let empty = results.hits.is_empty();
+    Ok(SearchTemplate {
+        username,
+        query: query.to_string(),
+        hits: results.hits,
+        total: results.total,
+        empty,
+        truncated,
+    }
+    .into_response())
 }
 
 async fn save_dictation(
@@ -299,6 +349,7 @@ pub fn app(state: AppState) -> Router {
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
         .route("/dictations/{id}", get(show_dictation))
+        .route("/search", get(search))
         .route("/api/dictations", post(save_dictation))
         .route("/model/whistle.cact", get(model))
         .route("/healthz", get(healthz))

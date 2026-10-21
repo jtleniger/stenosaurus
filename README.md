@@ -105,8 +105,8 @@ node --test tests/pcm.test.mjs            # resampler, accumulator, async queue
 
 The vendored `cactus-needle` browser build documents Chromium as tested; Safari
 and iOS are unverified. The site is mobile-first, but the acceptance browser is
-Chromium-class on desktop. A full-text search feature is intentionally not part
-of this build.
+Chromium-class on desktop. Search is server-rendered: the index page has a
+search box, and results highlight matching text and work without JavaScript.
 
 ## License
 
