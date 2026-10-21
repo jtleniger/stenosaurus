@@ -2,10 +2,10 @@
 {% block title %}Search · Stenosaurus{% endblock %}
 {% block content %}
 {% include "header.html" %}
-<p class="back"><a href="/">← All dictations</a></p>
+<p class="back"><a href="/">← Back</a></p>
 {% include "search_form.html" %}
 {% if empty %}
-<p class="muted">No dictations match “{{ query }}”.</p>
+<p class="muted">No notes match “{{ query }}”.</p>
 {% else %}
 <p class="muted result-count">{{ total }} match{% if total != 1 %}es{% endif %}{% if truncated %} · showing the first {{ hits.len() }}{% endif %}</p>
 <ul class="list">

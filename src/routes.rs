@@ -265,7 +265,7 @@ async fn save_dictation(
         return Err(ApiError::unprocessable("No speech detected. Try again."));
     }
     if payload.text.chars().count() > MAX_TEXT_CHARS {
-        return Err(ApiError::unprocessable("Dictation is too long."));
+        return Err(ApiError::unprocessable("Note is too long."));
     }
     let saved = state.store.save(&payload.text).await.map_err(|err| {
         tracing::error!(%err, "could not save dictation");

@@ -121,7 +121,7 @@ async function startDictation() {
     session = await getSpeech();
   } catch (error) {
     mic.disabled = false;
-    setStatus('Tap to dictate');
+    setStatus('Start Note');
     showError(describe(error));
     return;
   }
@@ -138,7 +138,7 @@ async function startDictation() {
     });
   } catch (error) {
     mic.disabled = false;
-    setStatus('Tap to dictate');
+    setStatus('Start Note');
     showError('Microphone access was blocked. Allow it and try again.');
     return;
   }
@@ -159,7 +159,7 @@ async function startDictation() {
     stream.getTracks().forEach(track => track.stop());
     ctx?.close().catch(() => {});
     mic.disabled = false;
-    setStatus('Tap to dictate');
+    setStatus('Start Note');
     showError('Could not start audio capture: ' + describe(error));
     return;
   }
@@ -207,7 +207,7 @@ async function startDictation() {
 
   mic.disabled = false;
   mic.classList.add('recording');
-  mic.setAttribute('aria-label', 'Stop dictation');
+  mic.setAttribute('aria-label', 'Stop note');
   setStatus('Listening… tap to stop');
   if (timerEl) {
     timerEl.hidden = false;
@@ -253,7 +253,7 @@ async function stopDictation() {
 
   recorder = null;
   mic.classList.remove('recording');
-  mic.setAttribute('aria-label', 'Start dictation');
+  mic.setAttribute('aria-label', 'Start note');
 
   if (state.loopError) {
     const code = state.loopError?.code;
@@ -265,7 +265,7 @@ async function stopDictation() {
   const text = state.committed.trim();
   if (text === '') {
     if (liveEl) liveEl.hidden = true;
-    setStatus('No speech detected. Tap to dictate.');
+    setStatus('No speech detected. Start Note.');
     mic.disabled = false;
     if (state.loopError) showError(describe(state.loopError));
     return;
@@ -281,7 +281,7 @@ async function stopDictation() {
       body: JSON.stringify({ text })
     });
   } catch (error) {
-    setStatus('Tap to dictate');
+    setStatus('Start Note');
     showError('Could not reach the server. Your text is still shown above.');
     if (state.loopError) showError(describe(state.loopError));
     mic.disabled = false;
@@ -294,7 +294,7 @@ async function stopDictation() {
       window.location.assign('/dictations/' + encodeURIComponent(saved.id));
       return;
     }
-    setStatus('Tap to dictate');
+    setStatus('Start Note');
     showError('The server returned an unexpected response. Your text is still shown above.');
     mic.disabled = false;
     return;
@@ -304,10 +304,10 @@ async function stopDictation() {
     showError('Your session expired. Reload the page and sign in again.');
   } else {
     const data = await response.json().catch(() => ({}));
-    showError(data.error || 'Could not save the dictation.');
+    showError(data.error || 'Could not save the note.');
   }
   if (state.loopError) showError(describe(state.loopError));
-  setStatus('Tap to dictate');
+  setStatus('Start Note');
   if (liveEl) liveEl.hidden = false;
   mic.disabled = false;
 }
@@ -329,38 +329,4 @@ for (const el of document.querySelectorAll('time[data-local]')) {
       timeStyle: 'short'
     });
   }
-}
-
-// Copy button on the dictation detail page.
-const copyButton = document.getElementById('copy');
-if (copyButton) {
-  copyButton.addEventListener('click', async () => {
-    const target = document.getElementById(copyButton.dataset.copyTarget);
-    if (!target) return;
-    const text = target.textContent ?? '';
-    let copied = false;
-    try {
-      await navigator.clipboard.writeText(text);
-      copied = true;
-    } catch {
-      const area = document.createElement('textarea');
-      area.value = text;
-      area.setAttribute('readonly', '');
-      area.style.position = 'fixed';
-      area.style.opacity = '0';
-      document.body.appendChild(area);
-      area.select();
-      try {
-        copied = document.execCommand('copy');
-      } catch {
-        copied = false;
-      }
-      area.remove();
-    }
-    const original = copyButton.textContent;
-    copyButton.textContent = copied ? 'Copied' : 'Copy failed';
-    setTimeout(() => {
-      copyButton.textContent = original;
-    }, 1500);
-  });
 }
