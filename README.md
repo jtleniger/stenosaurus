@@ -113,4 +113,6 @@ search box, and results highlight matching text and work without JavaScript.
 Stenosaurus is licensed under the GNU General Public License v3.0; see
 [LICENSE](LICENSE). Vendored Whistle assets retain their upstream licenses:
 `cactus-needle` is Apache-2.0, and the script copies its `LICENSE` and `NOTICE`
-into `static/vendor/cactus-needle-0.3.0/`.
+into `static/vendor/cactus-needle-0.3.0/`. The bundled UI fonts (Orbitron,
+Rajdhani, and Share Tech Mono) are licensed under the SIL Open Font License 1.1;
+their license texts are in `static/fonts/`.

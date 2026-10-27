@@ -138,7 +138,7 @@ async fn login_then_index_renders_recorder() {
     let response = app.request("GET", "/", Some(&cookie), None, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = text(response).await;
-    assert!(body.contains("No dictations yet"), "body: {body}");
+    assert!(body.contains("No notes yet"), "body: {body}");
     assert!(body.contains("id=\"live\""), "body: {body}");
     assert!(body.contains("/static/app.js"), "body: {body}");
 }
