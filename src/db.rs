@@ -29,7 +29,18 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS notes_newest
     ON notes (recorded_at DESC, sequence DESC);
 
-PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS drafts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    text       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS drafts_recent
+    ON drafts (updated_at DESC, id DESC);
+
+PRAGMA user_version = 2;
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -125,7 +136,7 @@ mod tests {
             .call(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let tables: Vec<String> = db
             .call(|conn| -> rusqlite::Result<Vec<String>> {
                 let mut stmt = conn
@@ -139,6 +150,7 @@ mod tests {
             .unwrap();
         assert!(tables.contains(&"notes".to_string()));
         assert!(tables.contains(&"users".to_string()));
+        assert!(tables.contains(&"drafts".to_string()));
 
         #[cfg(unix)]
         {
@@ -175,5 +187,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(username, "alice");
+    }
+
+    #[tokio::test]
+    async fn migrates_a_version_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DB_FILE);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     username TEXT NOT NULL,
+                     password_hash TEXT NOT NULL
+                 );
+                 CREATE TABLE notes (
+                     id TEXT PRIMARY KEY,
+                     recorded_at INTEGER NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     text TEXT NOT NULL,
+                     text_lower TEXT NOT NULL
+                 );
+                 INSERT INTO notes VALUES ('old', 1, 0, 'kept', 'kept');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(dir.path()).await.unwrap();
+        let (version, note, has_drafts): (i64, String, bool) = db
+            .call(|conn| -> rusqlite::Result<(i64, String, bool)> {
+                let version = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                let note =
+                    conn.query_row("SELECT text FROM notes WHERE id = 'old'", [], |row| {
+                        row.get(0)
+                    })?;
+                let has_drafts = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                                   WHERE type = 'table' AND name = 'drafts')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((version, note, has_drafts))
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(note, "kept");
+        assert!(has_drafts);
     }
 }

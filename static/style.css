@@ -349,6 +349,111 @@ button.link:hover {
   font-style: italic;
 }
 
+.draft-name-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin-bottom: 1.25rem;
+  text-align: left;
+}
+
+.draft-name-row label {
+  flex: none;
+  font-family: var(--font-display);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.draft-name-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.55rem 0.7rem;
+  font-family: var(--font-display);
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+}
+
+.draft-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.65rem;
+  margin-top: 1.15rem;
+}
+
+.draft-actions #save {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.draft-actions #save:hover {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+}
+
+.draft-actions #discard {
+  color: var(--muted);
+}
+
+.draft-actions #discard:hover {
+  color: var(--danger);
+}
+
+.draft-status {
+  min-height: 1.2em;
+  margin: 0.65rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.draft-status.error {
+  color: var(--danger);
+}
+
+/* Drafts */
+
+.drafts-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 2.25rem 0 0.85rem;
+}
+
+.drafts-head h2 {
+  margin: 0;
+}
+
+.drafts-head form {
+  flex: none;
+  margin: 0;
+}
+
+.drafts-head button {
+  padding: 0.45rem 0.8rem;
+  font-size: 0.72rem;
+}
+
+.draft-title {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-display);
+  font-size: 0.82rem;
+  letter-spacing: 0.05em;
+  color: var(--fg);
+}
+
 /* Lists */
 
 .list {

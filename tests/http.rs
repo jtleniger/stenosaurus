@@ -92,15 +92,64 @@ async fn login(app: &TestApp) -> String {
     pair
 }
 
-async fn save(app: &TestApp, cookie: &str, json: &str) -> axum::response::Response {
+async fn create_draft(app: &TestApp, cookie: &str) -> i64 {
+    let response = app
+        .request("POST", "/api/drafts", Some(cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = text(response).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    json["id"].as_i64().expect("draft id")
+}
+
+async fn update_draft(
+    app: &TestApp,
+    cookie: &str,
+    id: i64,
+    json: &str,
+) -> axum::response::Response {
     app.request(
-        "POST",
-        "/api/dictations",
+        "PUT",
+        &format!("/api/drafts/{id}"),
         Some(cookie),
         Some("application/json"),
         Some(Body::from(json.to_string())),
     )
     .await
+}
+
+async fn save_draft(app: &TestApp, cookie: &str, id: i64, json: &str) -> axum::response::Response {
+    app.request(
+        "POST",
+        &format!("/api/drafts/{id}/save"),
+        Some(cookie),
+        Some("application/json"),
+        Some(Body::from(json.to_string())),
+    )
+    .await
+}
+
+async fn add_note(app: &TestApp, cookie: &str, content: &str) -> String {
+    let id = create_draft(app, cookie).await;
+    let updated = update_draft(
+        app,
+        cookie,
+        id,
+        &serde_json::json!({ "text": content }).to_string(),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let response = save_draft(
+        app,
+        cookie,
+        id,
+        &serde_json::json!({ "text": content }).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = text(response).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    json["id"].as_str().expect("note id").to_string()
 }
 
 #[tokio::test]
@@ -125,7 +174,10 @@ async fn wrong_password_is_rejected() {
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let body = text(response).await;
-    assert!(body.contains("Invalid username or password"), "body: {body}");
+    assert!(
+        body.contains("Invalid username or password"),
+        "body: {body}"
+    );
 }
 
 #[tokio::test]
@@ -137,55 +189,103 @@ async fn login_then_index_renders_recorder() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = text(response).await;
     assert!(body.contains("No notes yet"), "body: {body}");
+    assert!(body.contains("No drafts yet"), "body: {body}");
     assert!(body.contains("id=\"live\""), "body: {body}");
+    assert!(body.contains("action=\"/drafts/new\""), "body: {body}");
     assert!(body.contains("/static/app.js"), "body: {body}");
 }
 
 #[tokio::test]
 async fn api_requires_json_401_not_redirect() {
     let app = TestApp::new().await;
-    let response = app
-        .request(
-            "POST",
-            "/api/dictations",
-            None,
-            Some("application/json"),
-            Some(Body::from(r#"{"text":"hi"}"#)),
-        )
-        .await;
+    let response = app.request("POST", "/api/drafts", None, None, None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "application/json"
-    );
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     let body = text(response).await;
     assert!(body.contains("Not signed in."), "body: {body}");
 }
 
 #[tokio::test]
-async fn saves_and_shows_a_dictation() {
+async fn drafts_autosave_without_creating_notes_or_search_hits() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
 
-    let response = save(&app, &cookie, r#"{"text":"hello world"}"#).await;
+    let id = create_draft(&app, &cookie).await;
+    let response = update_draft(
+        &app,
+        &cookie,
+        id,
+        r#"{"name":"Groceries","text":"hello draft"}"#,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "application/json"
+    let body = text(response).await;
+    assert!(body.contains("Groceries"), "body: {body}");
+    assert!(body.contains("hello draft"), "body: {body}");
+
+    // Autosaved text lives only in the draft, not in notes or search results.
+    assert!(app.store.list().await.unwrap().is_empty());
+    let search = app
+        .request("GET", "/search?q=hello", Some(&cookie), None, None)
+        .await;
+    assert_eq!(search.status(), StatusCode::OK);
+    let search_body = text(search).await;
+    assert!(
+        search_body.contains("No notes match"),
+        "body: {search_body}"
     );
+
+    let index = app
+        .request("GET", &format!("/?draft={id}"), Some(&cookie), None, None)
+        .await;
+    assert_eq!(index.status(), StatusCode::OK);
+    let index_body = text(index).await;
+    assert!(
+        index_body.contains("value=\"Groceries\""),
+        "body: {index_body}"
+    );
+    assert!(index_body.contains("hello draft"), "body: {index_body}");
+    assert!(index_body.contains("No notes yet"), "body: {index_body}");
+}
+
+#[tokio::test]
+async fn saving_a_draft_promotes_it_to_a_note() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let id = create_draft(&app, &cookie).await;
+    assert_eq!(
+        update_draft(&app, &cookie, id, r#"{"text":"old autosave"}"#)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // The client sends its full text so a failed autosave still saves correctly.
+    let response = save_draft(&app, &cookie, id, r#"{"text":"hello world"}"#).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     let body = text(response).await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["text"], "hello world");
-    let id = json["id"].as_str().unwrap().to_string();
+    let note_id = json["id"].as_str().unwrap().to_string();
 
+    assert!(app.store.get_draft(id).await.unwrap().is_none());
     let list = app.store.list().await.unwrap();
     assert_eq!(list.len(), 1);
-    assert_eq!(list[0].id, id);
-    let content = app.store.get(&id).await.unwrap().unwrap().text;
-    assert_eq!(content, "hello world");
+    assert_eq!(list[0].id, note_id);
+    assert_eq!(
+        app.store.get(&note_id).await.unwrap().unwrap().text,
+        "hello world"
+    );
 
     let detail = app
-        .request("GET", &format!("/dictations/{id}"), Some(&cookie), None, None)
+        .request(
+            "GET",
+            &format!("/dictations/{note_id}"),
+            Some(&cookie),
+            None,
+            None,
+        )
         .await;
     assert_eq!(detail.status(), StatusCode::OK);
     let detail_body = text(detail).await;
@@ -193,55 +293,160 @@ async fn saves_and_shows_a_dictation() {
 }
 
 #[tokio::test]
-async fn rejects_whitespace_only_text() {
+async fn rejects_saving_an_empty_draft() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
+    let id = create_draft(&app, &cookie).await;
 
-    let response = save(&app, &cookie, r#"{"text":"   \n\t  "}"#).await;
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let body = text(response).await;
-    assert!(body.contains("No speech detected"), "body: {body}");
+    for payload in ["{}", r#"{"text":"   \n\t  "}"#] {
+        let response = save_draft(&app, &cookie, id, payload).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = text(response).await;
+        assert!(body.contains("Draft is empty"), "body: {body}");
+    }
     assert!(app.store.list().await.unwrap().is_empty());
+    assert!(app.store.get_draft(id).await.unwrap().is_some());
 }
 
 #[tokio::test]
-async fn rejects_overlong_text() {
+async fn rejects_overlong_draft_text() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
+    let id = create_draft(&app, &cookie).await;
 
     let long = "a".repeat(200_001);
     let payload = serde_json::json!({ "text": long }).to_string();
-    let response = save(&app, &cookie, &payload).await;
+    let response = update_draft(&app, &cookie, id, &payload).await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = text(response).await;
     assert!(body.contains("too long"), "body: {body}");
-    assert!(app.store.list().await.unwrap().is_empty());
+    assert!(app
+        .store
+        .get_draft(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .text
+        .is_empty());
 }
 
 #[tokio::test]
-async fn rejects_malformed_json() {
+async fn rejects_malformed_draft_json() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let id = create_draft(&app, &cookie).await;
+
+    let response = save_draft(&app, &cookie, id, "not json").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body = text(response).await;
+    assert!(body.contains("JSON body"), "body: {body}");
+}
+
+#[tokio::test]
+async fn discards_a_draft() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let id = create_draft(&app, &cookie).await;
+    assert_eq!(
+        update_draft(&app, &cookie, id, r#"{"text":"throw me away"}"#)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let response = app
+        .request(
+            "DELETE",
+            &format!("/api/drafts/{id}"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(app.store.get_draft(id).await.unwrap().is_none());
+    let index = app
+        .request("GET", &format!("/?draft={id}"), Some(&cookie), None, None)
+        .await;
+    assert_eq!(index.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn multiple_drafts_are_listed_and_selectable() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let first = create_draft(&app, &cookie).await;
+    let second = create_draft(&app, &cookie).await;
+    assert_eq!(
+        update_draft(&app, &cookie, first, r#"{"name":"First","text":"alpha"}"#)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        update_draft(&app, &cookie, second, r#"{"name":"Second","text":"beta"}"#)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let index = app
+        .request(
+            "GET",
+            &format!("/?draft={first}"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(index.status(), StatusCode::OK);
+    let body = text(index).await;
+    assert!(body.contains("value=\"First\""), "body: {body}");
+    assert!(body.contains("alpha"), "body: {body}");
+    assert!(body.contains("Second"), "body: {body}");
+    assert!(body.contains(&format!("/?draft={second}")), "body: {body}");
+
+    assert_eq!(app.store.list_drafts().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn unknown_draft_endpoints_are_404() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
 
-    let response = save(&app, &cookie, "not json").await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "application/json"
-    );
-    let body = text(response).await;
-    assert!(body.contains("JSON body"), "body: {body}");
+    let update = update_draft(&app, &cookie, 999, r#"{"text":"x"}"#).await;
+    assert_eq!(update.status(), StatusCode::NOT_FOUND);
+    let save = save_draft(&app, &cookie, 999, r#"{"text":"x"}"#).await;
+    assert_eq!(save.status(), StatusCode::NOT_FOUND);
+    let delete = app
+        .request("DELETE", "/api/drafts/999", Some(&cookie), None, None)
+        .await;
+    assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+    let index = app
+        .request("GET", "/?draft=999", Some(&cookie), None, None)
+        .await;
+    assert_eq!(index.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn new_draft_form_creates_and_redirects() {
+    let app = TestApp::new().await;
+    let cookie = login(&app).await;
+    let response = app
+        .request("POST", "/drafts/new", Some(&cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with("/?draft="), "location: {location}");
+    assert_eq!(app.store.list_drafts().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn transcript_is_html_escaped() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
-    let saved = app
-        .store
-        .save("<script>alert(1)</script>")
-        .await
-        .unwrap();
+    let saved = app.store.save("<script>alert(1)</script>").await.unwrap();
 
     let response = app
         .request(
@@ -276,10 +481,8 @@ async fn search_requires_login() {
 async fn search_finds_and_highlights_dictation() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
-    let saved = save(&app, &cookie, r#"{"text":"hello world"}"#).await;
-    assert_eq!(saved.status(), StatusCode::OK);
-    let saved = save(&app, &cookie, r#"{"text":"goodbye"}"#).await;
-    assert_eq!(saved.status(), StatusCode::OK);
+    add_note(&app, &cookie, "hello world").await;
+    add_note(&app, &cookie, "goodbye").await;
 
     let response = app
         .request("GET", "/search?q=HELLO", Some(&cookie), None, None)
@@ -294,18 +497,8 @@ async fn search_finds_and_highlights_dictation() {
 async fn search_requires_every_term() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
-    assert_eq!(
-        save(&app, &cookie, r#"{"text":"alpha beta"}"#)
-            .await
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        save(&app, &cookie, r#"{"text":"alpha only"}"#)
-            .await
-            .status(),
-        StatusCode::OK
-    );
+    add_note(&app, &cookie, "alpha beta").await;
+    add_note(&app, &cookie, "alpha only").await;
 
     let response = app
         .request("GET", "/search?q=alpha%20beta", Some(&cookie), None, None)
@@ -334,11 +527,7 @@ async fn search_with_blank_query_redirects_home() {
 async fn search_escapes_transcript_html() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
-    let saved = app
-        .store
-        .save("<script>alert(1)</script>")
-        .await
-        .unwrap();
+    let saved = app.store.save("<script>alert(1)</script>").await.unwrap();
     assert_eq!(saved.text, "<script>alert(1)</script>");
 
     let response = app
@@ -381,10 +570,7 @@ async fn model_requires_login_and_streams_bytes() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     let headers = response.headers().clone();
-    assert_eq!(
-        headers[header::CONTENT_TYPE],
-        "application/octet-stream"
-    );
+    assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
     assert_eq!(headers[header::CONTENT_LENGTH], "16");
     assert!(headers[header::CACHE_CONTROL]
         .to_str()

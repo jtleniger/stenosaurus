@@ -2,19 +2,53 @@
 {% block content %}
 {% include "header.html" %}
 
-<section class="recorder" aria-label="Note recorder">
+<section id="recorder" class="recorder" aria-label="Note recorder"{% if let Some(draft) = draft %} data-draft-id="{{ draft.id }}"{% endif %}>
+  <div class="draft-name-row">
+    <label for="draft-name">Draft</label>
+    <input id="draft-name" type="text" maxlength="200" placeholder="Untitled draft"
+           autocomplete="off" spellcheck="false"
+           {% if let Some(draft) = draft %}value="{{ draft.name }}"{% else %}disabled{% endif %}>
+  </div>
   <button id="dictate" class="mic" type="button" aria-label="Start note">
     <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true" focusable="false">
       <path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/>
     </svg>
   </button>
   <p id="timer" hidden>00:00</p>
-  <p id="status" role="status" aria-live="polite">Start Note</p>
+  <p id="status" role="status" aria-live="polite">{% if draft.is_some() %}Ready. Tap to dictate.{% else %}Start Note{% endif %}</p>
   <p id="error" class="error" role="alert" hidden></p>
-  <div id="live" class="live" role="log" aria-live="polite" hidden>
-    <p id="committed" class="committed"></p>
+  <div id="live" class="live" role="log" aria-live="polite"{% if draft.is_none() %} hidden{% endif %}>
+    <p id="committed" class="committed">{% if let Some(draft) = draft %}{{ draft.text }}{% endif %}</p>
     <p id="pending" class="pending"></p>
   </div>
+  <div class="draft-actions">
+    <button id="save" type="button" disabled>Save Note</button>
+    <button id="discard" type="button" class="link" disabled>Discard Draft</button>
+  </div>
+  <p id="draft-status" class="draft-status" role="status" aria-live="polite"></p>
+</section>
+
+<section class="drafts">
+  <div class="drafts-head">
+    <h2>Drafts</h2>
+    <form method="post" action="/drafts/new">
+      <button type="submit">New Draft</button>
+    </form>
+  </div>
+  {% if drafts.is_empty() %}
+  <p class="muted" id="drafts-empty">No drafts yet. Press the microphone or New Draft to start one.</p>
+  {% endif %}
+  <ul class="list" id="draft-list"{% if drafts.is_empty() %} hidden{% endif %}>
+    {% for d in drafts %}
+    <li>
+      <a href="/?draft={{ d.id }}">
+        <span class="draft-title">{{ d.label() }}</span>
+        <span class="preview">{{ d.preview }}</span>
+        <time datetime="{{ d.updated_iso }}" data-local>{{ d.updated_display }}</time>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
 </section>
 
 {% include "search_form.html" %}
@@ -22,7 +56,7 @@
 <section class="dictations">
   <h2>Notes</h2>
   {% if empty %}
-  <p class="muted">No notes yet. Press the microphone and speak.</p>
+  <p class="muted">No notes yet. Save a draft to add one here.</p>
   {% else %}
   <ul class="list">
     {% for d in dictations %}

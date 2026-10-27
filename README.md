@@ -1,16 +1,19 @@
 # Stenosaurus
 
 A self-hosted, single-user dictation site. Speak into the page; the transcript
-appears while you talk, and the final text is saved to SQLite.
+appears while you talk. Stopping the microphone pauses instead of saving, so you
+can think, talk to someone, or wait out background noise and continue later.
+Everything transcribed is autosaved server-side as a draft; pressing **Save
+Note** moves the draft into the notes list, where it becomes searchable.
 
 Speech recognition runs entirely in the browser: microphone audio is captured
 as raw PCM, resampled to 16 kHz mono, and streamed to Whistle running as
 WebAssembly in a module worker (via the pinned `cactus-needle` browser package).
-Audio never leaves the browser. The Rust server only receives the final text,
+Audio never leaves the browser. The Rust server only receives transcript text,
 stores it, and serves the 16.9 MB model to authenticated clients.
 
-No account registration, no email: one username/password and all notes live in
-the SQLite database `data/stenosaurus.db`.
+No account registration, no email: one username/password and all notes and
+drafts live in the SQLite database `data/stenosaurus.db`.
 
 ## Requirements
 
@@ -41,6 +44,21 @@ Generated assets are **not** committed: `vendor/` and `static/vendor/` are in
 browser downloads about 17.8 MB (engine + model) from your own server into
 CacheStorage; later sessions load from cache.
 
+## Drafts and saving
+
+The microphone is a pause/resume control, not a save control:
+
+- Each committed transcript chunk is written to the open draft immediately.
+- Tapping the microphone again stops capture but keeps the draft; tapping it
+  later resumes in the same draft, including after a page reload or on another
+  device signed in to the same account.
+- **Save Note** promotes the draft into the notes list and search index. The
+  note keeps the draft's start time, not the save time.
+- **Discard Draft** deletes it. Notes themselves still have no delete UI.
+- Multiple drafts can coexist. Name them in the Draft field and switch using
+  the Drafts list; the page URL carries `?draft=<id>`, so reloads reopen the
+  same draft.
+
 ## Configuration
 
 |Variable|Flag|Default|
@@ -61,12 +79,13 @@ Restart the server after changing the account.
 
 ```
 data/
-└── stenosaurus.db   # users + notes (SQLite, WAL mode)
+└── stenosaurus.db   # users + drafts + notes (SQLite, WAL mode)
 ```
 
-The database holds the `users` table (one Argon2id password hash) and the
-`notes` table (transcript text plus its UTC recording time). `stenosaurus.db-wal`
-and `stenosaurus.db-shm` appear while the server is running; they are part of the
+The database holds the `users` table (one Argon2id password hash), the `drafts`
+table (unsaved name, text, and start/edit times), and the `notes` table
+(transcript text plus its UTC recording time). `stenosaurus.db-wal` and
+`stenosaurus.db-shm` appear while the server is running; they are part of the
 database and must not be deleted on their own.
 
 Back up a live server with SQLite's online backup command:
@@ -76,8 +95,9 @@ sqlite3 data/stenosaurus.db ".backup 'stenosaurus-backup.db'"
 ```
 
 Or stop the server and copy `data/stenosaurus.db`. Restore by stopping the
-server and replacing the file. There is no delete UI; remove a note directly
-from the `notes` table when needed.
+server and replacing the file. Drafts have a discard button, but saved notes
+still have no delete UI; remove a note directly from the `notes` table when
+needed.
 
 Sessions are in memory, so restarting the server signs everyone out.
 

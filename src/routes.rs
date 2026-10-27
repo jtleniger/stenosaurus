@@ -10,7 +10,7 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Form, Json, Router};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
@@ -21,9 +21,10 @@ use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 use crate::auth::SESSION_KEY;
 use crate::error::{ApiError, PageError};
 use crate::state::AppState;
-use crate::storage::{DictationSummary, SearchHit};
+use crate::storage::{DictationSummary, Draft, DraftSummary, SearchHit, StoreError};
 
 const MAX_TEXT_CHARS: usize = 200_000;
+const MAX_DRAFT_NAME_CHARS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 100;
 
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
@@ -34,6 +35,8 @@ base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
 #[template(path = "index.html")]
 struct IndexTemplate {
     username: String,
+    draft: Option<Draft>,
+    drafts: Vec<DraftSummary>,
     dictations: Vec<DictationSummary>,
     empty: bool,
     query: String,
@@ -71,19 +74,42 @@ struct LoginForm {
 }
 
 #[derive(Deserialize)]
+struct IndexParams {
+    draft: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SearchParams {
     q: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct NewDictation {
-    text: String,
+struct SaveDraft {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateDraft {
+    name: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 struct DictationResponse {
     id: String,
     text: String,
+}
+
+#[derive(serde::Serialize)]
+struct DraftResponse {
+    id: i64,
+    name: String,
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct CreatedDraft {
+    id: i64,
 }
 
 /// Page requests redirect to the login form when unauthenticated.
@@ -137,7 +163,31 @@ impl FromRequestParts<AppState> for ApiUser {
 async fn index(
     State(state): State<AppState>,
     AuthedUser(username): AuthedUser,
+    Query(params): Query<IndexParams>,
 ) -> Result<IndexTemplate, PageError> {
+    let drafts = state.store.list_drafts().await.map_err(|err| {
+        tracing::error!(%err, "could not list drafts");
+        PageError::internal()
+    })?;
+
+    let draft = match params.draft.as_deref() {
+        Some(raw) => {
+            let id = raw.parse::<i64>().map_err(|_| PageError::not_found())?;
+            let draft = state.store.get_draft(id).await.map_err(|err| {
+                tracing::error!(%err, "could not read draft");
+                PageError::internal()
+            })?;
+            Some(draft.ok_or_else(PageError::not_found)?)
+        }
+        None => match drafts.first() {
+            Some(latest) => state.store.get_draft(latest.id).await.map_err(|err| {
+                tracing::error!(%err, "could not read draft");
+                PageError::internal()
+            })?,
+            None => None,
+        },
+    };
+
     let dictations = state.store.list().await.map_err(|err| {
         tracing::error!(%err, "could not list dictations");
         PageError::internal()
@@ -145,6 +195,8 @@ async fn index(
     let empty = dictations.is_empty();
     Ok(IndexTemplate {
         username,
+        draft,
+        drafts,
         dictations,
         empty,
         query: String::new(),
@@ -213,7 +265,8 @@ async fn show_dictation(
     let Some(dictation) = state.store.get(&id).await.map_err(|err| {
         tracing::error!(%err, "could not read dictation");
         PageError::internal()
-    })? else {
+    })?
+    else {
         return Err(PageError::not_found());
     };
     Ok(DictationTemplate {
@@ -254,34 +307,121 @@ async fn search(
     .into_response())
 }
 
-async fn save_dictation(
+async fn create_draft(
     State(state): State<AppState>,
     ApiUser(_): ApiUser,
-    payload: Result<Json<NewDictation>, JsonRejection>,
+) -> Result<(StatusCode, Json<CreatedDraft>), ApiError> {
+    let id = state.store.create_draft().await.map_err(|err| {
+        tracing::error!(%err, "could not create draft");
+        ApiError::internal()
+    })?;
+    Ok((StatusCode::CREATED, Json(CreatedDraft { id })))
+}
+
+async fn new_draft_page(
+    State(state): State<AppState>,
+    AuthedUser(_): AuthedUser,
+) -> Result<Redirect, PageError> {
+    let id = state.store.create_draft().await.map_err(|err| {
+        tracing::error!(%err, "could not create draft");
+        PageError::internal()
+    })?;
+    Ok(Redirect::to(&format!("/?draft={id}")))
+}
+
+async fn update_draft(
+    State(state): State<AppState>,
+    ApiUser(_): ApiUser,
+    Path(id): Path<i64>,
+    payload: Result<Json<UpdateDraft>, JsonRejection>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    let Json(payload) = payload
+        .map_err(|_| ApiError::bad_request("Expected a JSON body with a name or text field."))?;
+    if let Some(name) = &payload.name {
+        if name.trim().chars().count() > MAX_DRAFT_NAME_CHARS {
+            return Err(ApiError::unprocessable("Draft name is too long."));
+        }
+    }
+    if let Some(text) = &payload.text {
+        if text.chars().count() > MAX_TEXT_CHARS {
+            return Err(ApiError::unprocessable("Draft is too long."));
+        }
+    }
+    let updated = state
+        .store
+        .update_draft(id, payload.name, payload.text)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "could not update draft");
+            ApiError::internal()
+        })?;
+    match updated {
+        Some(draft) => Ok(Json(DraftResponse {
+            id: draft.id,
+            name: draft.name,
+            text: draft.text,
+        })),
+        None => Err(ApiError::not_found()),
+    }
+}
+
+async fn delete_draft(
+    State(state): State<AppState>,
+    ApiUser(_): ApiUser,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let deleted = state.store.delete_draft(id).await.map_err(|err| {
+        tracing::error!(%err, "could not delete draft");
+        ApiError::internal()
+    })?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+async fn save_draft(
+    State(state): State<AppState>,
+    ApiUser(_): ApiUser,
+    Path(id): Path<i64>,
+    payload: Result<Json<SaveDraft>, JsonRejection>,
 ) -> Result<Json<DictationResponse>, ApiError> {
     let Json(payload) =
         payload.map_err(|_| ApiError::bad_request("Expected a JSON body with a text field."))?;
-    if payload.text.trim().is_empty() {
-        return Err(ApiError::unprocessable("No speech detected. Try again."));
+    if let Some(text) = &payload.text {
+        if text.trim().is_empty() {
+            return Err(ApiError::unprocessable(
+                "Draft is empty. Dictate something first.",
+            ));
+        }
+        if text.chars().count() > MAX_TEXT_CHARS {
+            return Err(ApiError::unprocessable("Note is too long."));
+        }
     }
-    if payload.text.chars().count() > MAX_TEXT_CHARS {
-        return Err(ApiError::unprocessable("Note is too long."));
+    match state.store.save_draft(id, payload.text.as_deref()).await {
+        Ok(saved) => Ok(Json(DictationResponse {
+            id: saved.id,
+            text: saved.text,
+        })),
+        Err(StoreError::NotFound) => Err(ApiError::not_found()),
+        Err(StoreError::Empty) => Err(ApiError::unprocessable(
+            "Draft is empty. Dictate something first.",
+        )),
+        Err(err) => {
+            tracing::error!(%err, "could not save draft");
+            Err(ApiError::internal())
+        }
     }
-    let saved = state.store.save(&payload.text).await.map_err(|err| {
-        tracing::error!(%err, "could not save dictation");
-        ApiError::internal()
-    })?;
-    Ok(Json(DictationResponse {
-        id: saved.id,
-        text: saved.text,
-    }))
 }
 
 async fn model(State(state): State<AppState>, ApiUser(_): ApiUser) -> Result<Response, ApiError> {
-    let file = tokio::fs::File::open(&state.model_path).await.map_err(|err| {
-        tracing::error!(%err, path = %state.model_path.display(), "could not open model");
-        ApiError::internal()
-    })?;
+    let file = tokio::fs::File::open(&state.model_path)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, path = %state.model_path.display(), "could not open model");
+            ApiError::internal()
+        })?;
     let length = file
         .metadata()
         .await
@@ -350,7 +490,10 @@ pub fn app(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/dictations/{id}", get(show_dictation))
         .route("/search", get(search))
-        .route("/api/dictations", post(save_dictation))
+        .route("/drafts/new", post(new_draft_page))
+        .route("/api/drafts", post(create_draft))
+        .route("/api/drafts/{id}", put(update_draft).delete(delete_draft))
+        .route("/api/drafts/{id}/save", post(save_draft))
         .route("/model/whistle.cact", get(model))
         .route("/healthz", get(healthz))
         .nest_service("/static", ServeDir::new(static_dir))

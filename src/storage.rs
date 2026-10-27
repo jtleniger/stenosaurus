@@ -45,6 +45,51 @@ pub struct Dictation {
     pub text: String,
 }
 
+/// An in-progress note that has not been saved to the notes list yet.
+#[derive(Debug, Clone)]
+pub struct Draft {
+    pub id: i64,
+    pub name: String,
+    pub text: String,
+    /// Microseconds since the epoch; the draft's note timestamp when saved.
+    pub created_at: i64,
+    pub created_iso: String,
+    pub created_display: String,
+    pub updated_iso: String,
+    pub updated_display: String,
+}
+
+impl Draft {
+    /// Human-readable label for the draft list.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            "Untitled draft"
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// A draft as shown in the draft list.
+#[derive(Debug, Clone)]
+pub struct DraftSummary {
+    pub id: i64,
+    pub name: String,
+    pub preview: String,
+    pub updated_iso: String,
+    pub updated_display: String,
+}
+
+impl DraftSummary {
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            "Untitled draft"
+        } else {
+            &self.name
+        }
+    }
+}
+
 /// One run of snippet text, highlighted when it matches the query.
 #[derive(Debug, Clone)]
 pub struct SnippetPart {
@@ -80,6 +125,8 @@ pub enum StoreError {
     Timestamp(#[from] time::error::ComponentRange),
     #[error("too many dictations share this timestamp")]
     Exhausted,
+    #[error("draft not found")]
+    NotFound,
 }
 
 /// SQLite-backed store for all notes.
@@ -124,20 +171,14 @@ impl DictationStore {
             let inserted = self
                 .db
                 .call(move |conn| {
-                    let result = conn.execute(
-                        "INSERT INTO notes (id, recorded_at, sequence, text, text_lower)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![insert_id, recorded_at, sequence, insert_body, insert_lower],
-                    );
-                    match result {
-                        Ok(_) => Ok(true),
-                        Err(rusqlite::Error::SqliteFailure(err, _))
-                            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-                        {
-                            Ok(false)
-                        }
-                        Err(err) => Err(err),
-                    }
+                    insert_note(
+                        conn,
+                        &insert_id,
+                        recorded_at,
+                        sequence,
+                        &insert_body,
+                        &insert_lower,
+                    )
                 })
                 .await?;
             if inserted {
@@ -284,6 +325,253 @@ impl DictationStore {
             text,
         }))
     }
+
+    /// Create an empty draft and return its id.
+    pub async fn create_draft(&self) -> Result<i64, StoreError> {
+        self.create_draft_at(OffsetDateTime::now_utc()).await
+    }
+
+    /// Create an empty draft with an explicit start time; used by tests.
+    pub(crate) async fn create_draft_at(&self, at: OffsetDateTime) -> Result<i64, StoreError> {
+        let created_at = to_micros(at);
+        let id = self
+            .db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO drafts (name, created_at, updated_at, text)
+                     VALUES ('', ?1, ?1, '')",
+                    params![created_at],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await?;
+        Ok(id)
+    }
+
+    /// All drafts, most recently edited first.
+    pub async fn list_drafts(&self) -> Result<Vec<DraftSummary>, StoreError> {
+        let rows = self
+            .db
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, updated_at, substr(text, 1, 400) FROM drafts
+                     ORDER BY updated_at DESC, id DESC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let mut drafts = Vec::with_capacity(rows.len());
+        for (id, name, updated_at, text) in rows {
+            let updated = from_micros(updated_at)?;
+            let (_, updated_iso, updated_display) = render(updated)?;
+            drafts.push(DraftSummary {
+                id,
+                name,
+                preview: preview(&text),
+                updated_iso,
+                updated_display,
+            });
+        }
+        Ok(drafts)
+    }
+
+    /// Load one draft; unknown ids are `None`.
+    pub async fn get_draft(&self, id: i64) -> Result<Option<Draft>, StoreError> {
+        let row = self
+            .db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT name, created_at, updated_at, text FROM drafts WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
+            .await?;
+        let Some((name, created_at, updated_at, text)) = row else {
+            return Ok(None);
+        };
+        render_draft(id, name, created_at, updated_at, text).map(Some)
+    }
+
+    /// Replace the supplied draft fields and bump its edit time.
+    pub async fn update_draft(
+        &self,
+        id: i64,
+        name: Option<String>,
+        text: Option<String>,
+    ) -> Result<Option<Draft>, StoreError> {
+        let name = name.map(|name| name.trim().to_string());
+        let text = text.map(|text| text.trim().to_string());
+        let updated_at = to_micros(OffsetDateTime::now_utc());
+        let changed = self
+            .db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE drafts
+                     SET name = COALESCE(?2, name),
+                         text = COALESCE(?3, text),
+                         updated_at = ?4
+                     WHERE id = ?1",
+                    params![id, name, text, updated_at],
+                )
+            })
+            .await?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_draft(id).await
+    }
+
+    /// Delete a draft; false when it was already gone.
+    pub async fn delete_draft(&self, id: i64) -> Result<bool, StoreError> {
+        let deleted = self
+            .db
+            .call(move |conn| conn.execute("DELETE FROM drafts WHERE id = ?1", params![id]))
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    /// Move a draft into the notes table and delete it.
+    ///
+    /// `text` overrides the stored draft body so a save still succeeds when the
+    /// last background autosave failed. The note is dated from the draft's
+    /// creation, not from the moment Save was pressed.
+    pub async fn save_draft(&self, id: i64, text: Option<&str>) -> Result<Dictation, StoreError> {
+        let Some(draft) = self.get_draft(id).await? else {
+            return Err(StoreError::NotFound);
+        };
+        let body = match text {
+            Some(text) => text.trim().to_string(),
+            None => draft.text.trim().to_string(),
+        };
+        if body.is_empty() {
+            return Err(StoreError::Empty);
+        }
+        let at = from_micros(draft.created_at)?;
+        let (base, iso, display) = render(at)?;
+        let recorded_at = draft.created_at;
+        let body_lower = body.to_lowercase();
+        let base_for_call = base.clone();
+        let body_for_call = body.clone();
+
+        let outcome = self
+            .db
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM drafts WHERE id = ?1)",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Ok(PromoteOutcome::Missing);
+                }
+                for sequence in 0..MAX_SEQUENCE {
+                    let note_id = if sequence == 0 {
+                        base_for_call.clone()
+                    } else {
+                        format!("{base_for_call}-{sequence}")
+                    };
+                    if insert_note(
+                        &tx,
+                        &note_id,
+                        recorded_at,
+                        sequence,
+                        &body_for_call,
+                        &body_lower,
+                    )? {
+                        tx.execute("DELETE FROM drafts WHERE id = ?1", params![id])?;
+                        tx.commit()?;
+                        return Ok(PromoteOutcome::Saved(note_id));
+                    }
+                }
+                Ok(PromoteOutcome::Exhausted)
+            })
+            .await?;
+
+        match outcome {
+            PromoteOutcome::Saved(note_id) => Ok(Dictation {
+                id: note_id,
+                iso,
+                display,
+                text: body,
+            }),
+            PromoteOutcome::Missing => Err(StoreError::NotFound),
+            PromoteOutcome::Exhausted => Err(StoreError::Exhausted),
+        }
+    }
+}
+
+enum PromoteOutcome {
+    Saved(String),
+    Missing,
+    Exhausted,
+}
+
+fn insert_note(
+    conn: &rusqlite::Connection,
+    id: &str,
+    recorded_at: i64,
+    sequence: u32,
+    body: &str,
+    body_lower: &str,
+) -> rusqlite::Result<bool> {
+    let result = conn.execute(
+        "INSERT INTO notes (id, recorded_at, sequence, text, text_lower)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, recorded_at, sequence, body, body_lower],
+    );
+    match result {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn render_draft(
+    id: i64,
+    name: String,
+    created_at: i64,
+    updated_at: i64,
+    text: String,
+) -> Result<Draft, StoreError> {
+    let created = from_micros(created_at)?;
+    let updated = from_micros(updated_at)?;
+    let (_, created_iso, created_display) = render(created)?;
+    let (_, updated_iso, updated_display) = render(updated)?;
+    Ok(Draft {
+        id,
+        name,
+        text,
+        created_at,
+        created_iso,
+        created_display,
+        updated_iso,
+        updated_display,
+    })
 }
 
 /// Format the same instant as a filename stem, ISO timestamp and display string.
@@ -654,5 +942,135 @@ mod tests {
         let results = store.search("   ", 100).await.unwrap();
         assert_eq!(results.total, 0);
         assert!(results.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drafts_are_named_updated_and_deleted() {
+        let (_guard, store) = store().await;
+        let first = store
+            .create_draft_at(datetime!(2026-10-20 12:00:00 UTC))
+            .await
+            .unwrap();
+        let second = store
+            .create_draft_at(datetime!(2026-10-20 12:01:00 UTC))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_draft(
+                first,
+                Some("  Shopping  ".to_string()),
+                Some("  milk  ".to_string()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.name, "Shopping");
+        assert_eq!(updated.text, "milk");
+        assert_eq!(updated.created_iso, "2026-10-20T12:00:00Z");
+
+        let list = store.list_drafts().await.unwrap();
+        assert_eq!(list.len(), 2);
+        let first_summary = list.iter().find(|draft| draft.id == first).unwrap();
+        assert_eq!(first_summary.label(), "Shopping");
+        assert_eq!(first_summary.preview, "milk");
+
+        assert!(store.delete_draft(first).await.unwrap());
+        assert!(!store.delete_draft(first).await.unwrap());
+        assert!(store.get_draft(first).await.unwrap().is_none());
+        assert!(store.get_draft(second).await.unwrap().is_some());
+        assert!(store
+            .update_draft(first, Some("x".into()), None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn saving_a_draft_uses_its_start_time_and_removes_it() {
+        let (_guard, store) = store().await;
+        let at = datetime!(2026-10-20 12:34:56.123456 UTC);
+        let id = store.create_draft_at(at).await.unwrap();
+        store
+            .update_draft(
+                id,
+                Some("Note".to_string()),
+                Some("hello draft".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let saved = store.save_draft(id, None).await.unwrap();
+        assert_eq!(saved.id, "2026-10-20T12-34-56.123456Z");
+        assert_eq!(saved.iso, "2026-10-20T12:34:56Z");
+        assert_eq!(saved.text, "hello draft");
+        assert!(store.get_draft(id).await.unwrap().is_none());
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        assert_eq!(store.list_drafts().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn saving_a_draft_accepts_the_clients_latest_text() {
+        let (_guard, store) = store().await;
+        let id = store
+            .create_draft_at(datetime!(2026-10-20 12:00:00 UTC))
+            .await
+            .unwrap();
+        store
+            .update_draft(id, None, Some("old autosave".to_string()))
+            .await
+            .unwrap();
+
+        let saved = store.save_draft(id, Some("newer text")).await.unwrap();
+        assert_eq!(saved.text, "newer text");
+        assert!(store.get_draft(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_draft_is_not_saved() {
+        let (_guard, store) = store().await;
+        let id = store
+            .create_draft_at(datetime!(2026-10-20 12:00:00 UTC))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.save_draft(id, None).await,
+            Err(StoreError::Empty)
+        ));
+        assert!(matches!(
+            store.save_draft(id, Some("   ")).await,
+            Err(StoreError::Empty)
+        ));
+        assert!(store.get_draft(id).await.unwrap().is_some());
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_draft_shares_timestamp_with_existing_note() {
+        let (_guard, store) = store().await;
+        let at = datetime!(2026-10-20 12:00:00 UTC);
+        store.save_at(at, "existing").await.unwrap();
+        let id = store.create_draft_at(at).await.unwrap();
+        store
+            .update_draft(id, None, Some("draft".to_string()))
+            .await
+            .unwrap();
+        let saved = store.save_draft(id, None).await.unwrap();
+        assert_eq!(saved.id, "2026-10-20T12-00-00.000000Z-1");
+    }
+
+    #[tokio::test]
+    async fn unknown_draft_operations_fail() {
+        let (_guard, store) = store().await;
+        assert!(matches!(
+            store.save_draft(99, Some("text")).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(store
+            .update_draft(99, Some("x".into()), None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store.delete_draft(99).await.unwrap());
     }
 }
