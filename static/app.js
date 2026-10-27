@@ -79,56 +79,9 @@ function updateActions() {
   if (nameEl) nameEl.disabled = !draftId;
 }
 
-function draftLink() {
-  if (!draftId) return null;
-  return document.querySelector('#draft-list a[href="/?draft=' + draftId + '"]');
-}
-
-function previewText(text) {
-  const collapsed = text.split(/\s+/).filter(Boolean).join(' ');
-  if (!collapsed) return '(empty)';
-  return collapsed.length > 140 ? collapsed.slice(0, 140) + '…' : collapsed;
-}
-
-function updateDraftSummary() {
-  const link = draftLink();
-  if (!link) return;
-  const title = link.querySelector('.draft-title');
-  if (title) title.textContent = nameEl?.value.trim() || 'Untitled draft';
-  const preview = link.querySelector('.preview');
-  if (preview) preview.textContent = previewText(committed);
-}
-
-function ensureDraftListItem() {
-  const list = document.getElementById('draft-list');
-  if (!list || !draftId) return;
-  const empty = document.getElementById('drafts-empty');
-  if (empty) empty.hidden = true;
-  list.hidden = false;
-  if (draftLink()) {
-    updateDraftSummary();
-    return;
-  }
-  const item = document.createElement('li');
-  const link = document.createElement('a');
-  link.href = '/?draft=' + draftId;
-  const title = document.createElement('span');
-  title.className = 'draft-title';
-  title.textContent = 'Untitled draft';
-  const preview = document.createElement('span');
-  preview.className = 'preview';
-  preview.textContent = previewText(committed);
-  const time = document.createElement('time');
-  time.textContent = 'Just now';
-  link.append(title, preview, time);
-  item.append(link);
-  list.prepend(item);
-}
-
 function render() {
   if (committedEl) committedEl.textContent = committed;
   if (liveEl) liveEl.hidden = !committed.trim() && !recorder;
-  updateDraftSummary();
   updateActions();
 }
 
@@ -152,11 +105,8 @@ async function ensureDraft() {
   if (!Number.isFinite(draftId)) throw new Error('The server returned an unexpected response.');
   if (recorderEl) recorderEl.dataset.draftId = String(draftId);
   savedName = '';
-  const url = new URL(window.location.href);
-  url.searchParams.set('draft', String(draftId));
-  window.history.replaceState(null, '', url);
+  window.history.replaceState(null, '', '/drafts/' + draftId);
   setDraftStatus('');
-  ensureDraftListItem();
   updateActions();
   return draftId;
 }
@@ -225,7 +175,6 @@ async function syncName() {
   try {
     await putDraft({ name });
     savedName = name;
-    updateDraftSummary();
     setDraftStatus('Draft saved');
   } catch {
     setDraftStatus('Draft name not saved', true);
@@ -569,10 +518,7 @@ if (discardEl) {
 }
 
 if (nameEl) {
-  nameEl.addEventListener('input', () => {
-    updateDraftSummary();
-    scheduleNameSync();
-  });
+  nameEl.addEventListener('input', scheduleNameSync);
   nameEl.addEventListener('blur', () => {
     clearTimeout(nameTimer);
     syncName();

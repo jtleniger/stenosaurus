@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Record · Stenosaurus{% endblock %}
+{% block content %}
+{% include "nav.html" %}
+
+<section id="recorder" class="recorder" aria-label="Note recorder" data-draft-id="{{ draft.id }}">
+  <div class="draft-name-row">
+    <label for="draft-name">Draft</label>
+    <input id="draft-name" type="text" maxlength="200" placeholder="Untitled draft"
+           autocomplete="off" spellcheck="false" value="{{ draft.name }}">
+  </div>
+  <button id="dictate" class="mic" type="button" aria-label="Start note">
+    <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/>
+    </svg>
+  </button>
+  <p id="timer" hidden>00:00</p>
+  <p id="status" role="status" aria-live="polite">Ready. Tap to dictate.</p>
+  <p id="error" class="error" role="alert" hidden></p>
+  <div id="live" class="live" role="log" aria-live="polite"{% if draft.text.is_empty() %} hidden{% endif %}>
+    <p id="committed" class="committed">{{ draft.text }}</p>
+    <p id="pending" class="pending"></p>
+  </div>
+  <div class="draft-actions">
+    <button id="save" type="button" disabled>Save Note</button>
+    <button id="discard" type="button" class="link">Discard Draft</button>
+  </div>
+  <p id="draft-status" class="draft-status" role="status" aria-live="polite"></p>
+</section>
+{% endblock %}

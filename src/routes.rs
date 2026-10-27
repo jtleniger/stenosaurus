@@ -34,12 +34,26 @@ base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
 #[derive(Template, WebTemplate)]
 #[template(path = "index.html")]
 struct IndexTemplate {
-    username: String,
-    draft: Option<Draft>,
-    drafts: Vec<DraftSummary>,
+    query: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "notes.html")]
+struct NotesTemplate {
     dictations: Vec<DictationSummary>,
     empty: bool,
-    query: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "drafts.html")]
+struct DraftsTemplate {
+    drafts: Vec<DraftSummary>,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "recorder.html")]
+struct RecorderTemplate {
+    draft: Draft,
 }
 
 #[derive(Template, WebTemplate)]
@@ -59,7 +73,6 @@ struct DictationTemplate {
 #[derive(Template, WebTemplate)]
 #[template(path = "search.html")]
 struct SearchTemplate {
-    username: String,
     query: String,
     hits: Vec<SearchHit>,
     total: usize,
@@ -71,11 +84,6 @@ struct SearchTemplate {
 struct LoginForm {
     username: String,
     password: String,
-}
-
-#[derive(Deserialize)]
-struct IndexParams {
-    draft: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -160,47 +168,46 @@ impl FromRequestParts<AppState> for ApiUser {
     }
 }
 
-async fn index(
+async fn index(AuthedUser(_): AuthedUser) -> IndexTemplate {
+    IndexTemplate {
+        query: String::new(),
+    }
+}
+
+async fn notes(
     State(state): State<AppState>,
-    AuthedUser(username): AuthedUser,
-    Query(params): Query<IndexParams>,
-) -> Result<IndexTemplate, PageError> {
-    let drafts = state.store.list_drafts().await.map_err(|err| {
-        tracing::error!(%err, "could not list drafts");
-        PageError::internal()
-    })?;
-
-    let draft = match params.draft.as_deref() {
-        Some(raw) => {
-            let id = raw.parse::<i64>().map_err(|_| PageError::not_found())?;
-            let draft = state.store.get_draft(id).await.map_err(|err| {
-                tracing::error!(%err, "could not read draft");
-                PageError::internal()
-            })?;
-            Some(draft.ok_or_else(PageError::not_found)?)
-        }
-        None => match drafts.first() {
-            Some(latest) => state.store.get_draft(latest.id).await.map_err(|err| {
-                tracing::error!(%err, "could not read draft");
-                PageError::internal()
-            })?,
-            None => None,
-        },
-    };
-
+    AuthedUser(_): AuthedUser,
+) -> Result<NotesTemplate, PageError> {
     let dictations = state.store.list().await.map_err(|err| {
         tracing::error!(%err, "could not list dictations");
         PageError::internal()
     })?;
     let empty = dictations.is_empty();
-    Ok(IndexTemplate {
-        username,
-        draft,
-        drafts,
-        dictations,
-        empty,
-        query: String::new(),
-    })
+    Ok(NotesTemplate { dictations, empty })
+}
+
+async fn drafts_page(
+    State(state): State<AppState>,
+    AuthedUser(_): AuthedUser,
+) -> Result<DraftsTemplate, PageError> {
+    let drafts = state.store.list_drafts().await.map_err(|err| {
+        tracing::error!(%err, "could not list drafts");
+        PageError::internal()
+    })?;
+    Ok(DraftsTemplate { drafts })
+}
+
+async fn show_draft(
+    State(state): State<AppState>,
+    AuthedUser(_): AuthedUser,
+    Path(id): Path<i64>,
+) -> Result<RecorderTemplate, PageError> {
+    let draft = state.store.get_draft(id).await.map_err(|err| {
+        tracing::error!(%err, "could not read draft");
+        PageError::internal()
+    })?;
+    let draft = draft.ok_or_else(PageError::not_found)?;
+    Ok(RecorderTemplate { draft })
 }
 
 async fn login_page(session: Session) -> Result<Response, PageError> {
@@ -278,7 +285,7 @@ async fn show_dictation(
 
 async fn search(
     State(state): State<AppState>,
-    AuthedUser(username): AuthedUser,
+    AuthedUser(_): AuthedUser,
     Query(params): Query<SearchParams>,
 ) -> Result<Response, PageError> {
     let query = params.q.unwrap_or_default();
@@ -297,7 +304,6 @@ async fn search(
     let truncated = results.total > results.hits.len();
     let empty = results.hits.is_empty();
     Ok(SearchTemplate {
-        username,
         query: query.to_string(),
         hits: results.hits,
         total: results.total,
@@ -326,7 +332,7 @@ async fn new_draft_page(
         tracing::error!(%err, "could not create draft");
         PageError::internal()
     })?;
-    Ok(Redirect::to(&format!("/?draft={id}")))
+    Ok(Redirect::to(&format!("/drafts/{id}")))
 }
 
 async fn update_draft(
@@ -488,6 +494,9 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(index))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
+        .route("/notes", get(notes))
+        .route("/drafts", get(drafts_page))
+        .route("/drafts/{id}", get(show_draft))
         .route("/dictations/{id}", get(show_dictation))
         .route("/search", get(search))
         .route("/drafts/new", post(new_draft_page))

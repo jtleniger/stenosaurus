@@ -56,8 +56,15 @@ The microphone is a pause/resume control, not a save control:
   note keeps the draft's start time, not the save time.
 - **Discard Draft** deletes it. Notes themselves still have no delete UI.
 - Multiple drafts can coexist. Name them in the Draft field and switch using
-  the Drafts list; the page URL carries `?draft=<id>`, so reloads reopen the
-  same draft.
+  the **Drafts** page; each draft lives at `/drafts/<id>`, so reloads reopen
+  the same draft.
+
+## Pages
+
+- `/` — start a recording, or search notes.
+- `/notes` — saved notes; open one to read its transcript.
+- `/drafts` — open drafts for resuming or saving.
+- `/drafts/<id>` — the recorder for one draft.
 
 ## Configuration
 

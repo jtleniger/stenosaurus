@@ -134,9 +134,9 @@ a:hover {
   outline-offset: 3px;
 }
 
-/* Header */
+/* Nav */
 
-.bar {
+.nav {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -144,35 +144,37 @@ a:hover {
   padding-bottom: 0.9rem;
   margin-bottom: 1.75rem;
   border-bottom: 1px solid var(--border);
-}
-
-.bar h1 {
-  margin: 0;
-  min-width: 0;
-  font-size: clamp(0.95rem, 3.6vw, 1.25rem);
-  white-space: nowrap;
-}
-
-.who {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 0.75rem;
-  min-width: 0;
   font-family: var(--font-mono);
   font-size: 0.8rem;
 }
 
-.who .muted {
+.nav .brand {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--font-display);
+  font-size: clamp(0.9rem, 3.4vw, 1.1rem);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg);
+  text-decoration: none;
 }
 
-.who form {
-  margin: 0;
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
   flex: none;
+}
+
+.nav-links a {
+  text-decoration: none;
+}
+
+.nav-links form {
+  margin: 0;
 }
 
 button {
@@ -224,6 +226,23 @@ button.link:hover {
 }
 
 /* Recorder */
+
+.record-form {
+  margin: 0;
+}
+
+.record-form .record {
+  width: 100%;
+  padding: 1.1rem;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.record-form .record:hover {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+}
 
 .recorder {
   text-align: center;
@@ -419,28 +438,6 @@ button.link:hover {
 
 /* Drafts */
 
-.drafts-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  margin: 2.25rem 0 0.85rem;
-}
-
-.drafts-head h2 {
-  margin: 0;
-}
-
-.drafts-head form {
-  flex: none;
-  margin: 0;
-}
-
-.drafts-head button {
-  padding: 0.45rem 0.8rem;
-  font-size: 0.72rem;
-}
-
 .draft-title {
   display: block;
   width: 100%;
@@ -619,22 +616,6 @@ input:focus {
 }
 
 /* Detail */
-
-.back {
-  margin: 0 0 1.25rem;
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.back a {
-  text-decoration: none;
-}
-
-.back a:hover {
-  color: var(--fg);
-}
 
 .stamp {
   margin: 0 0 0.75rem;

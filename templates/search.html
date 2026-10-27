@@ -1,8 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Search · Stenosaurus{% endblock %}
 {% block content %}
-{% include "header.html" %}
-<p class="back"><a href="/">← Back</a></p>
+{% include "nav.html" %}
 {% include "search_form.html" %}
 {% if empty %}
 <p class="muted">No notes match “{{ query }}”.</p>

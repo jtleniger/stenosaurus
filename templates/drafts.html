@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Drafts · Stenosaurus{% endblock %}
+{% block content %}
+{% include "nav.html" %}
+
+<h1>Drafts</h1>
+{% if drafts.is_empty() %}
+<p class="muted">No drafts yet. Record a note to start one.</p>
+{% else %}
+<ul class="list">
+  {% for d in drafts %}
+  <li>
+    <a href="/drafts/{{ d.id }}">
+      <span class="draft-title">{{ d.label() }}</span>
+      <span class="preview">{{ d.preview }}</span>
+      <time datetime="{{ d.updated_iso }}" data-local>{{ d.updated_display }}</time>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

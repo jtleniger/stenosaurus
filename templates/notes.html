@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Notes · Stenosaurus{% endblock %}
+{% block content %}
+{% include "nav.html" %}
+
+<h1>Notes</h1>
+{% if empty %}
+<p class="muted">No notes yet. Save a draft to add one here.</p>
+{% else %}
+<ul class="list">
+  {% for d in dictations %}
+  <li>
+    <a href="/dictations/{{ d.id }}">
+      <time datetime="{{ d.iso }}" data-local>{{ d.display }}</time>
+      <span class="preview">{{ d.preview }}</span>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}
