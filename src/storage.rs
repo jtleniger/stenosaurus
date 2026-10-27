@@ -1,15 +1,16 @@
-//! Filesystem-backed dictation storage.
+//! SQLite-backed dictation storage.
 //!
-//! One plain-text file per dictation, named after the UTC timestamp of the
-//! recording. The directory is the source of truth: there is no database.
-
-use std::io;
-use std::path::{Path, PathBuf};
+//! Notes live in the `notes` table of the shared [`Database`]. Ids keep the
+//! timestamp form used in URLs and are unique; notes sharing a timestamp get
+//! a `-<sequence>` suffix.
 
 use regex::{Regex, RegexBuilder};
+use rusqlite::{params, params_from_iter, OptionalExtension};
 use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+
+use crate::db::Database;
 
 /// Filename timestamp, e.g. `2026-10-20T12-34-56.123456Z`.
 pub const FILE_FORMAT: &[BorrowedFormatItem<'static>] =
@@ -67,40 +68,28 @@ pub struct SearchResults {
     pub hits: Vec<SearchHit>,
 }
 
-/// One parsed dictation file, before rendering.
-struct StoredEntry {
-    at: OffsetDateTime,
-    sequence: u32,
-    id: String,
-    text: String,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("storage error: {0}")]
-    Io(#[from] io::Error),
+    #[error("database error: {0}")]
+    Db(#[from] tokio_rusqlite::Error),
     #[error("no speech was detected")]
     Empty,
     #[error("timestamp formatting error: {0}")]
     Format(#[from] time::error::Format),
+    #[error("invalid timestamp: {0}")]
+    Timestamp(#[from] time::error::ComponentRange),
     #[error("too many dictations share this timestamp")]
     Exhausted,
 }
 
-/// Directory of `*.txt` dictations.
+/// SQLite-backed store for all notes.
 pub struct DictationStore {
-    dir: PathBuf,
+    db: Database,
 }
 
 impl DictationStore {
-    pub async fn new(dir: PathBuf) -> Result<Self, StoreError> {
-        tokio::fs::create_dir_all(&dir).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
-        }
-        Ok(Self { dir })
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     /// Save `text` under the current UTC time.
@@ -119,7 +108,9 @@ impl DictationStore {
             return Err(StoreError::Empty);
         }
         let (base, iso, display) = render(at)?;
-        let body = format!("{}\n", text.trim_end());
+        let recorded_at = to_micros(at);
+        let body = text.to_string();
+        let body_lower = body.to_lowercase();
 
         for sequence in 0..MAX_SEQUENCE {
             let id = if sequence == 0 {
@@ -127,80 +118,71 @@ impl DictationStore {
             } else {
                 format!("{base}-{sequence}")
             };
-            let path = self.dir.join(format!("{id}.txt"));
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            let mut file = match options.open(&path).await {
-                Ok(file) => file,
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err.into()),
-            };
-            if let Err(err) = tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes()).await {
-                let _ = tokio::fs::remove_file(&path).await;
-                return Err(err.into());
+            let insert_id = id.clone();
+            let insert_body = body.clone();
+            let insert_lower = body_lower.clone();
+            let inserted = self
+                .db
+                .call(move |conn| {
+                    let result = conn.execute(
+                        "INSERT INTO notes (id, recorded_at, sequence, text, text_lower)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![insert_id, recorded_at, sequence, insert_body, insert_lower],
+                    );
+                    match result {
+                        Ok(_) => Ok(true),
+                        Err(rusqlite::Error::SqliteFailure(err, _))
+                            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                        {
+                            Ok(false)
+                        }
+                        Err(err) => Err(err),
+                    }
+                })
+                .await?;
+            if inserted {
+                return Ok(Dictation {
+                    id,
+                    iso,
+                    display,
+                    text: body,
+                });
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
-            }
-            return Ok(Dictation {
-                id,
-                iso,
-                display,
-                text: text.to_string(),
-            });
         }
         Err(StoreError::Exhausted)
     }
 
-    /// Read and parse every dictation file, newest first.
-    async fn entries(&self) -> Result<Vec<StoredEntry>, StoreError> {
-        let mut entries = Vec::new();
-        let mut dir = tokio::fs::read_dir(&self.dir).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let path = entry.path();
-            if !entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            if path.extension() != Some(std::ffi::OsStr::new("txt")) {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Some((at, sequence)) = parse_id(stem) else {
-                continue;
-            };
-            let text = match tokio::fs::read_to_string(&path).await {
-                Ok(text) => text,
-                Err(err) => {
-                    tracing::warn!(%err, path = %path.display(), "skipping unreadable dictation");
-                    continue;
-                }
-            };
-            entries.push(StoredEntry {
-                at,
-                sequence,
-                id: stem.to_string(),
-                text,
-            });
-        }
-        entries.sort_by(|a, b| (b.at, b.sequence).cmp(&(a.at, a.sequence)));
-        Ok(entries)
-    }
-
     /// All dictations, newest first.
     pub async fn list(&self) -> Result<Vec<DictationSummary>, StoreError> {
-        let entries = self.entries().await?;
-        let mut summaries = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let (_, iso, display) = render(entry.at)?;
+        let rows = self
+            .db
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, recorded_at, text FROM notes
+                     ORDER BY recorded_at DESC, sequence DESC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for (id, recorded_at, text) in rows {
+            let at = from_micros(recorded_at)?;
+            let (_, iso, display) = render(at)?;
             summaries.push(DictationSummary {
-                id: entry.id,
+                id,
                 iso,
                 display,
-                preview: preview(&entry.text),
+                preview: preview(&text),
             });
         }
         Ok(summaries)
@@ -224,48 +206,83 @@ impl DictationStore {
             });
         }
 
+        // ASCII terms can be filtered in SQL against the pre-folded column.
+        // Terms containing non-ASCII characters are verified in Rust so that
+        // SQLite's simpler case mapping cannot hide a legitimate match.
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .filter(|term| term.is_ascii())
+            .map(|term| term.to_ascii_lowercase())
+            .collect();
+
+        let rows = self
+            .db
+            .call(move |conn| {
+                let mut sql = String::from("SELECT id, recorded_at, text FROM notes WHERE 1 = 1");
+                for _ in &terms {
+                    sql.push_str(" AND instr(text_lower, ?) > 0");
+                }
+                sql.push_str(" ORDER BY recorded_at DESC, sequence DESC");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(params_from_iter(terms.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
         let mut total = 0;
         let mut hits = Vec::new();
-        for entry in self.entries().await? {
-            if !patterns.iter().all(|pattern| pattern.is_match(&entry.text)) {
+        for (id, recorded_at, text) in rows {
+            if !patterns.iter().all(|pattern| pattern.is_match(&text)) {
                 continue;
             }
             total += 1;
             if hits.len() < limit {
-                let (_, iso, display) = render(entry.at)?;
+                let at = from_micros(recorded_at)?;
+                let (_, iso, display) = render(at)?;
                 hits.push(SearchHit {
-                    id: entry.id,
+                    id,
                     iso,
                     display,
-                    snippet: snippet(&entry.text, &patterns),
+                    snippet: snippet(&text, &patterns),
                 });
             }
         }
         Ok(SearchResults { total, hits })
     }
 
-    /// Load one dictation; invalid or unknown ids are `None`.
+    /// Load one dictation; unknown ids are `None`.
     pub async fn get(&self, id: &str) -> Result<Option<Dictation>, StoreError> {
-        let Some((at, _sequence)) = parse_id(id) else {
+        let lookup = id.to_string();
+        let row = self
+            .db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT recorded_at, text FROM notes WHERE id = ?1",
+                    params![lookup],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+            })
+            .await?;
+        let Some((recorded_at, text)) = row else {
             return Ok(None);
         };
-        let path = self.dir.join(format!("{id}.txt"));
-        let text = match tokio::fs::read_to_string(&path).await {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
+        let at = from_micros(recorded_at)?;
         let (_, iso, display) = render(at)?;
         Ok(Some(Dictation {
             id: id.to_string(),
             iso,
             display,
-            text: text.trim_end().to_string(),
+            text,
         }))
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 }
 
@@ -280,16 +297,14 @@ fn render(at: OffsetDateTime) -> Result<(String, String, String), StoreError> {
     ))
 }
 
-/// Parse a filename stem (with optional `-<sequence>` suffix) back to UTC time.
-fn parse_id(id: &str) -> Option<(OffsetDateTime, u32)> {
-    let (base, sequence) = match id.rsplit_once('-') {
-        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
-            (head, tail.parse::<u32>().ok()?)
-        }
-        _ => (id, 0),
-    };
-    let primitive = PrimitiveDateTime::parse(base, FILE_FORMAT).ok()?;
-    Some((primitive.assume_utc(), sequence))
+fn to_micros(at: OffsetDateTime) -> i64 {
+    (at.unix_timestamp_nanos() / 1000) as i64
+}
+
+fn from_micros(micros: i64) -> Result<OffsetDateTime, StoreError> {
+    Ok(OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(micros) * 1000,
+    )?)
 }
 
 /// Collapse whitespace and shorten to a one-line preview.
@@ -414,26 +429,25 @@ fn forward_chars(text: &str, byte: usize, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use time::macros::datetime;
 
     async fn store() -> (tempfile::TempDir, DictationStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = DictationStore::new(dir.path().join("dictations")).await.unwrap();
-        (dir, store)
+        let db = Database::open(dir.path()).await.unwrap();
+        (dir, DictationStore::new(db))
     }
 
     #[tokio::test]
-    async fn saves_timestamp_filename_and_newline() {
+    async fn saves_timestamp_id_and_text() {
         let (_guard, store) = store().await;
         let at = datetime!(2026-10-20 12:34:56.123456 UTC);
         let saved = store.save_at(at, "hello world").await.unwrap();
         assert_eq!(saved.id, "2026-10-20T12-34-56.123456Z");
         assert_eq!(saved.iso, "2026-10-20T12:34:56Z");
         assert_eq!(saved.display, "20 Oct 2026, 12:34 UTC");
-        let content = tokio::fs::read_to_string(store.dir().join(format!("{}.txt", saved.id)))
-            .await
-            .unwrap();
-        assert_eq!(content, "hello world\n");
+        let loaded = store.get(&saved.id).await.unwrap().unwrap();
+        assert_eq!(loaded.text, "hello world");
     }
 
     #[tokio::test]
@@ -444,12 +458,12 @@ mod tests {
         let second = store.save_at(at, "second").await.unwrap();
         assert_eq!(first.id, "2026-10-20T12-34-56.123456Z");
         assert_eq!(second.id, "2026-10-20T12-34-56.123456Z-1");
-        assert!(store.dir().join(format!("{}.txt", first.id)).is_file());
-        assert!(store.dir().join(format!("{}.txt", second.id)).is_file());
+        assert_eq!(store.get(&first.id).await.unwrap().unwrap().text, "first");
+        assert_eq!(store.get(&second.id).await.unwrap().unwrap().text, "second");
     }
 
     #[tokio::test]
-    async fn lists_newest_first_and_ignores_other_entries() {
+    async fn lists_newest_first() {
         let (_guard, store) = store().await;
         store
             .save_at(datetime!(2026-10-20 12:00:00 UTC), "older")
@@ -459,28 +473,11 @@ mod tests {
             .save_at(datetime!(2026-10-21 09:15:00 UTC), "newer")
             .await
             .unwrap();
-        tokio::fs::write(store.dir().join("notes.md"), "ignore me")
-            .await
-            .unwrap();
-        tokio::fs::create_dir(store.dir().join("subdir")).await.unwrap();
-        tokio::fs::create_dir(store.dir().join("2026-01-01T00-00-00.000000Z.txt"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            store.dir().join("1999-01-01T00-00-00.000000Z.txt"),
-            "directly in the directory",
-        )
-        .await
-        .unwrap();
         let list = store.list().await.unwrap();
         let ids: Vec<&str> = list.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
-            [
-                "2026-10-21T09-15-00.000000Z",
-                "2026-10-20T12-00-00.000000Z",
-                "1999-01-01T00-00-00.000000Z"
-            ]
+            ["2026-10-21T09-15-00.000000Z", "2026-10-20T12-00-00.000000Z"]
         );
         assert_eq!(list[0].preview, "newer");
     }
@@ -490,11 +487,15 @@ mod tests {
         let (_guard, store) = store().await;
         assert!(store.get("../x").await.unwrap().is_none());
         assert!(store.get("not-an-id").await.unwrap().is_none());
-        assert!(store.get("2026-10-20T12-34-56.123456Z").await.unwrap().is_none());
+        assert!(store
+            .get("2026-10-20T12-34-56.123456Z")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
-    async fn get_returns_saved_text() {
+    async fn gets_saved_text_trimmed() {
         let (_guard, store) = store().await;
         let saved = store
             .save_at(datetime!(2026-10-20 12:34:56 UTC), "  keep me  ")
@@ -512,6 +513,19 @@ mod tests {
         assert!(matches!(store.save("   \n").await, Err(StoreError::Empty)));
     }
 
+    #[tokio::test]
+    async fn persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let db = Database::open(dir.path()).await.unwrap();
+            let store = DictationStore::new(db);
+            store.save("durable").await.unwrap().id
+        };
+        let db = Database::open(dir.path()).await.unwrap();
+        let store = DictationStore::new(db);
+        assert_eq!(store.get(&id).await.unwrap().unwrap().text, "durable");
+    }
+
     #[test]
     fn preview_collapses_and_truncates() {
         assert_eq!(preview("a  b\n c "), "a b c");
@@ -524,18 +538,6 @@ mod tests {
         assert_eq!(preview(&exact), exact);
         let multibyte = "é".repeat(200);
         assert_eq!(preview(&multibyte).chars().count(), PREVIEW_CHARS + 1);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn files_and_directory_are_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_guard, store) = store().await;
-        let saved = store.save("secret").await.unwrap();
-        let meta = std::fs::metadata(store.dir().join(format!("{}.txt", saved.id))).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        let dir_meta = std::fs::metadata(store.dir()).unwrap();
-        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
     }
 
     async fn search_terms(store: &DictationStore, query: &str) -> SearchResults {

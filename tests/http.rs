@@ -7,6 +7,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use stenosaurus::auth::AuthConfig;
+use stenosaurus::db::Database;
 use stenosaurus::routes::app;
 use stenosaurus::state::AppState;
 use stenosaurus::storage::DictationStore;
@@ -20,11 +21,8 @@ struct TestApp {
 impl TestApp {
     async fn new() -> Self {
         let guard = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            DictationStore::new(guard.path().join("dictations"))
-                .await
-                .unwrap(),
-        );
+        let db = Database::open(guard.path()).await.unwrap();
+        let store = Arc::new(DictationStore::new(db));
         let static_dir = guard.path().join("static");
         std::fs::create_dir_all(&static_dir).unwrap();
         std::fs::write(static_dir.join("app.js"), "// placeholder").unwrap();
@@ -183,9 +181,8 @@ async fn saves_and_shows_a_dictation() {
     let list = app.store.list().await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, id);
-    let content =
-        std::fs::read_to_string(app.store.dir().join(format!("{id}.txt"))).unwrap();
-    assert_eq!(content, "hello world\n");
+    let content = app.store.get(&id).await.unwrap().unwrap().text;
+    assert_eq!(content, "hello world");
 
     let detail = app
         .request("GET", &format!("/dictations/{id}"), Some(&cookie), None, None)

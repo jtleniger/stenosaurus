@@ -1,7 +1,7 @@
 # Stenosaurus
 
 A self-hosted, single-user dictation site. Speak into the page; the transcript
-appears while you talk, and the final text is saved as a plain text file.
+appears while you talk, and the final text is saved to SQLite.
 
 Speech recognition runs entirely in the browser: microphone audio is captured
 as raw PCM, resampled to 16 kHz mono, and streamed to Whistle running as
@@ -9,8 +9,8 @@ WebAssembly in a module worker (via the pinned `cactus-needle` browser package).
 Audio never leaves the browser. The Rust server only receives the final text,
 stores it, and serves the 16.9 MB model to authenticated clients.
 
-No account registration, no email, no database: one username/password in
-`data/auth.toml`, and one file per dictation.
+No account registration, no email: one username/password and all notes live in
+the SQLite database `data/stenosaurus.db`.
 
 ## Requirements
 
@@ -61,15 +61,23 @@ Restart the server after changing the account.
 
 ```
 data/
-├── auth.toml                 # username + Argon2id PHC hash (0600)
-└── dictations/
-    └── 2026-10-20T12-34-56.123456Z.txt
+└── stenosaurus.db   # users + notes (SQLite, WAL mode)
 ```
 
-Filenames are UTC timestamps; the file content is the transcript plus a trailing
-newline. Back up `data/dictations/*.txt` (and `data/auth.toml`). Delete a file to
-delete a dictation. The directory is the source of truth; there is no index to
-rebuild.
+The database holds the `users` table (one Argon2id password hash) and the
+`notes` table (transcript text plus its UTC recording time). `stenosaurus.db-wal`
+and `stenosaurus.db-shm` appear while the server is running; they are part of the
+database and must not be deleted on their own.
+
+Back up a live server with SQLite's online backup command:
+
+```sh
+sqlite3 data/stenosaurus.db ".backup 'stenosaurus-backup.db'"
+```
+
+Or stop the server and copy `data/stenosaurus.db`. Restore by stopping the
+server and replacing the file. There is no delete UI; remove a note directly
+from the `notes` table when needed.
 
 Sessions are in memory, so restarting the server signs everyone out.
 

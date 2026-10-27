@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "stenosaurus", version, about = "Self-hosted browser dictation")]
 pub struct Cli {
-    /// Directory holding auth.toml and dictations/.
+    /// Directory holding stenosaurus.db.
     #[arg(long, global = true, env = "STENO_DATA_DIR", default_value = "data")]
     pub data_dir: PathBuf,
 

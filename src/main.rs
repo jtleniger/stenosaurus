@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use stenosaurus::auth::AuthConfig;
 use stenosaurus::cli::{Cli, Command, ServeArgs, UserCommand};
+use stenosaurus::db::Database;
 use stenosaurus::routes::app;
 use stenosaurus::state::AppState;
 use stenosaurus::storage::DictationStore;
@@ -26,8 +27,11 @@ async fn main() -> Result<()> {
         Command::User {
             command: UserCommand::Set { username },
         } => {
-            stenosaurus::auth::set_user(&cli.data_dir, &username)?;
-            println!("Wrote {}", cli.data_dir.join("auth.toml").display());
+            let db = Database::open(&cli.data_dir)
+                .await
+                .with_context(|| format!("could not open {}", cli.data_dir.display()))?;
+            stenosaurus::auth::set_user(&db, &username).await?;
+            println!("Wrote {}", db.path().display());
             println!("Restart the server to apply changes.");
         }
         Command::Serve(args) => serve(cli.data_dir, args).await?,
@@ -50,10 +54,11 @@ async fn serve(data_dir: std::path::PathBuf, args: ServeArgs) -> Result<()> {
         );
     }
 
-    let auth = AuthConfig::load(&data_dir)?;
-    let store = DictationStore::new(data_dir.join("dictations"))
+    let db = Database::open(&data_dir)
         .await
-        .with_context(|| format!("could not open {}", data_dir.join("dictations").display()))?;
+        .with_context(|| format!("could not open {}", data_dir.display()))?;
+    let auth = AuthConfig::load(&db).await?;
+    let store = DictationStore::new(db);
     let state = AppState {
         store: Arc::new(store),
         auth: Arc::new(auth),
