@@ -55,16 +55,18 @@ The microphone is a pause/resume control, not a save control:
 - **Save Note** promotes the draft into the notes list and search index. The
   note keeps the draft's start time, not the save time.
 - **Discard Draft** deletes it. Notes themselves still have no delete UI.
-- Multiple drafts can coexist. Name them in the Draft field and switch using
-  the **Drafts** page; each draft opens at `/?draft=<id>`, so reloads reopen
-  the same draft.
+- Drafts have no name. Each one is identified by its UUID and, in the UI, by
+  its start timestamp. Multiple drafts can coexist; switch between them on the
+  **Drafts** page. Each draft opens at `/?draft=<uuid>`, so reloads reopen the
+  same draft.
 
 ## Pages
 
-- `/` — the recorder and the search box. Opens the most recent draft, or
-  starts a new one with the microphone button.
-- `/notes` — saved notes; open one to read its transcript.
-- `/drafts` — open drafts for resuming or saving; each links back to `/?draft=<id>`.
+- `/` — the recorder. Opens the draft in `?draft=<uuid>`, or starts a new one
+  with the microphone button; it never restores a draft on its own.
+- `/notes` — saved notes and the search box; open one to read its transcript.
+- `/drafts` — open drafts for resuming or saving; each links back to `/?draft=<uuid>`.
+- `/search?q=…` — server-rendered results, linked from the notes page.
 
 ## Configuration
 
@@ -90,10 +92,11 @@ data/
 ```
 
 The database holds the `users` table (one Argon2id password hash), the `drafts`
-table (unsaved name, text, and start/edit times), and the `notes` table
-(transcript text plus its UTC recording time). `stenosaurus.db-wal` and
-`stenosaurus.db-shm` appear while the server is running; they are part of the
-database and must not be deleted on their own.
+table (unsaved text plus its start time), and the `notes` table (transcript text
+plus its start time). Notes and drafts are keyed by UUID, and timestamps are
+stored as fixed-width ISO 8601 UTC strings so they sort chronologically.
+`stenosaurus.db-wal` and `stenosaurus.db-shm` appear while the server is
+running; they are part of the database and must not be deleted on their own.
 
 Back up a live server with SQLite's online backup command:
 
@@ -140,7 +143,7 @@ node --test tests/pcm.test.mjs            # resampler, accumulator, async queue
 
 The vendored `cactus-needle` browser build documents Chromium as tested; Safari
 and iOS are unverified. The site is mobile-first, but the acceptance browser is
-Chromium-class on desktop. Search is server-rendered: the index page has a
+Chromium-class on desktop. Search is server-rendered: the notes page has a
 search box, and results highlight matching text and work without JavaScript.
 
 ## License

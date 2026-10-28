@@ -11,9 +11,8 @@
   {% for d in drafts %}
   <li>
     <a href="/?draft={{ d.id }}">
-      <span class="draft-title">{{ d.label() }}</span>
+      <time datetime="{{ d.created_iso }}" data-local>{{ d.created_display }}</time>
       <span class="preview">{{ d.preview }}</span>
-      <time datetime="{{ d.updated_iso }}" data-local>{{ d.updated_display }}</time>
     </a>
   </li>
   {% endfor %}

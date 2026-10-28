@@ -24,7 +24,6 @@ use crate::state::AppState;
 use crate::storage::{DictationSummary, Draft, DraftSummary, SearchHit, StoreError};
 
 const MAX_TEXT_CHARS: usize = 200_000;
-const MAX_DRAFT_NAME_CHARS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 100;
 
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
@@ -36,7 +35,6 @@ base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
 struct IndexTemplate {
     username: String,
     draft: Option<Draft>,
-    query: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -44,6 +42,7 @@ struct IndexTemplate {
 struct NotesTemplate {
     username: String,
     dictations: Vec<DictationSummary>,
+    query: String,
     empty: bool,
 }
 
@@ -103,7 +102,6 @@ struct SaveDraft {
 
 #[derive(Deserialize)]
 struct UpdateDraft {
-    name: Option<String>,
     text: Option<String>,
 }
 
@@ -115,14 +113,13 @@ struct DictationResponse {
 
 #[derive(serde::Serialize)]
 struct DraftResponse {
-    id: i64,
-    name: String,
+    id: String,
     text: String,
 }
 
 #[derive(serde::Serialize)]
 struct CreatedDraft {
-    id: i64,
+    id: String,
 }
 
 /// Page requests redirect to the login form when unauthenticated.
@@ -178,34 +175,18 @@ async fn index(
     AuthedUser(username): AuthedUser,
     Query(params): Query<IndexParams>,
 ) -> Result<IndexTemplate, PageError> {
-    let drafts = state.store.list_drafts().await.map_err(|err| {
-        tracing::error!(%err, "could not list drafts");
-        PageError::internal()
-    })?;
-
     let draft = match params.draft.as_deref() {
-        Some(raw) => {
-            let id = raw.parse::<i64>().map_err(|_| PageError::not_found())?;
+        Some(id) => {
             let draft = state.store.get_draft(id).await.map_err(|err| {
                 tracing::error!(%err, "could not read draft");
                 PageError::internal()
             })?;
             Some(draft.ok_or_else(PageError::not_found)?)
         }
-        None => match drafts.first() {
-            Some(latest) => state.store.get_draft(latest.id).await.map_err(|err| {
-                tracing::error!(%err, "could not read draft");
-                PageError::internal()
-            })?,
-            None => None,
-        },
+        None => None,
     };
 
-    Ok(IndexTemplate {
-        username,
-        draft,
-        query: String::new(),
-    })
+    Ok(IndexTemplate { username, draft })
 }
 
 async fn notes(
@@ -220,6 +201,7 @@ async fn notes(
     Ok(NotesTemplate {
         username,
         dictations,
+        query: String::new(),
         empty,
     })
 }
@@ -317,7 +299,7 @@ async fn search(
     let query = params.q.unwrap_or_default();
     let query = query.trim();
     if query.is_empty() {
-        return Ok(Redirect::to("/").into_response());
+        return Ok(Redirect::to("/notes").into_response());
     }
     let results = state
         .store
@@ -354,16 +336,11 @@ async fn create_draft(
 async fn update_draft(
     State(state): State<AppState>,
     ApiUser(_): ApiUser,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     payload: Result<Json<UpdateDraft>, JsonRejection>,
 ) -> Result<Json<DraftResponse>, ApiError> {
-    let Json(payload) = payload
-        .map_err(|_| ApiError::bad_request("Expected a JSON body with a name or text field."))?;
-    if let Some(name) = &payload.name {
-        if name.trim().chars().count() > MAX_DRAFT_NAME_CHARS {
-            return Err(ApiError::unprocessable("Draft name is too long."));
-        }
-    }
+    let Json(payload) =
+        payload.map_err(|_| ApiError::bad_request("Expected a JSON body with a text field."))?;
     if let Some(text) = &payload.text {
         if text.chars().count() > MAX_TEXT_CHARS {
             return Err(ApiError::unprocessable("Draft is too long."));
@@ -371,7 +348,7 @@ async fn update_draft(
     }
     let updated = state
         .store
-        .update_draft(id, payload.name, payload.text)
+        .update_draft(&id, payload.text)
         .await
         .map_err(|err| {
             tracing::error!(%err, "could not update draft");
@@ -380,7 +357,6 @@ async fn update_draft(
     match updated {
         Some(draft) => Ok(Json(DraftResponse {
             id: draft.id,
-            name: draft.name,
             text: draft.text,
         })),
         None => Err(ApiError::not_found()),
@@ -390,9 +366,9 @@ async fn update_draft(
 async fn delete_draft(
     State(state): State<AppState>,
     ApiUser(_): ApiUser,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let deleted = state.store.delete_draft(id).await.map_err(|err| {
+    let deleted = state.store.delete_draft(&id).await.map_err(|err| {
         tracing::error!(%err, "could not delete draft");
         ApiError::internal()
     })?;
@@ -406,7 +382,7 @@ async fn delete_draft(
 async fn save_draft(
     State(state): State<AppState>,
     ApiUser(_): ApiUser,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     payload: Result<Json<SaveDraft>, JsonRejection>,
 ) -> Result<Json<DictationResponse>, ApiError> {
     let Json(payload) =
@@ -421,7 +397,7 @@ async fn save_draft(
             return Err(ApiError::unprocessable("Note is too long."));
         }
     }
-    match state.store.save_draft(id, payload.text.as_deref()).await {
+    match state.store.save_draft(&id, payload.text.as_deref()).await {
         Ok(saved) => Ok(Json(DictationResponse {
             id: saved.id,
             text: saved.text,

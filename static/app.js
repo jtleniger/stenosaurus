@@ -7,48 +7,55 @@ const MODEL_SHA256 = 'b6e02f048568ac5d01a2042556c658061e699acbc0aa2a1439f52f3d46
 const recorderEl = document.getElementById('recorder');
 const mic = document.getElementById('dictate');
 const timerEl = document.getElementById('timer');
-const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const liveEl = document.getElementById('live');
 const committedEl = document.getElementById('committed');
 const pendingEl = document.getElementById('pending');
-const nameEl = document.getElementById('draft-name');
 const saveEl = document.getElementById('save');
 const discardEl = document.getElementById('discard');
-const draftStatusEl = document.getElementById('draft-status');
 
 let speech = null;
 let speechPromise = null;
 let recorder = null;
-let draftId = recorderEl?.dataset.draftId ? Number(recorderEl.dataset.draftId) : null;
+let draftId = recorderEl?.dataset.draftId || null;
 let committed = committedEl?.textContent?.trim() ?? '';
 let textPending = false;
 let textSync = null;
-let nameTimer = null;
-let savedName = nameEl?.value ?? '';
-
-function setStatus(text) {
-  if (statusEl) statusEl.textContent = text;
-}
-
-function setDraftStatus(text, isError = false) {
-  if (!draftStatusEl) return;
-  draftStatusEl.textContent = text;
-  draftStatusEl.classList.toggle('error', isError);
-}
+let errorTimer = null;
 
 function clearError() {
+  clearTimeout(errorTimer);
   if (!errorEl) return;
   errorEl.textContent = '';
   errorEl.hidden = true;
 }
 
+// Failures appear in a fixed toast so reporting them never moves the page.
 function showError(message) {
   if (!errorEl) return;
-  errorEl.textContent = errorEl.textContent
-    ? errorEl.textContent + ' ' + message
-    : message;
+  errorEl.textContent = message;
   errorEl.hidden = false;
+  clearTimeout(errorTimer);
+  errorTimer = setTimeout(clearError, 8000);
+}
+
+// Loading is drawn on the record button itself: the ring fills with download
+// progress while the button stays visually active instead of going quiet.
+function setLoading(progress) {
+  if (!mic) return;
+  if (progress == null) {
+    mic.classList.remove('loading');
+    mic.removeAttribute('aria-busy');
+    mic.style.removeProperty('--progress');
+    return;
+  }
+  mic.classList.add('loading');
+  mic.setAttribute('aria-busy', 'true');
+  const percent =
+    typeof progress === 'number' && Number.isFinite(progress)
+      ? Math.max(0, Math.min(100, Math.round(progress)))
+      : 0;
+  mic.style.setProperty('--progress', percent + '%');
 }
 
 function describe(error) {
@@ -67,16 +74,10 @@ function appendText(current, addition) {
   return left + ' ' + right;
 }
 
-function idleStatus() {
-  if (committed.trim()) return 'Paused. Tap to continue.';
-  return draftId ? 'Ready. Tap to dictate.' : 'Start Note';
-}
-
 function updateActions() {
   const hasText = committed.trim().length > 0;
   if (saveEl) saveEl.disabled = !draftId || !hasText || Boolean(recorder);
   if (discardEl) discardEl.disabled = !draftId || Boolean(recorder);
-  if (nameEl) nameEl.disabled = !draftId;
 }
 
 function render() {
@@ -100,20 +101,20 @@ async function ensureDraft() {
     credentials: 'same-origin'
   });
   if (!response.ok) throw await apiError(response);
-  const data = await response.json();
-  draftId = Number(data?.id);
-  if (!Number.isFinite(draftId)) throw new Error('The server returned an unexpected response.');
-  if (recorderEl) recorderEl.dataset.draftId = String(draftId);
-  savedName = '';
-  window.history.replaceState(null, '', '/?draft=' + draftId);
-  setDraftStatus('');
+  const data = await response.json().catch(() => null);
+  if (typeof data?.id !== 'string' || !data.id) {
+    throw new Error('The server returned an unexpected response.');
+  }
+  draftId = data.id;
+  if (recorderEl) recorderEl.dataset.draftId = draftId;
+  window.history.replaceState(null, '', '/?draft=' + encodeURIComponent(draftId));
   updateActions();
   return draftId;
 }
 
 async function putDraft(patch) {
   if (!draftId) throw new Error('No draft is open.');
-  const response = await fetch('/api/drafts/' + draftId, {
+  const response = await fetch('/api/drafts/' + encodeURIComponent(draftId), {
     method: 'PUT',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
@@ -132,13 +133,10 @@ function queueTextSync() {
     try {
       while (textPending) {
         textPending = false;
-        const snapshot = committed;
-        await putDraft({ text: snapshot });
-        setDraftStatus('Draft saved');
+        await putDraft({ text: committed });
       }
     } catch (error) {
       textPending = true;
-      setDraftStatus('Draft not saved — will retry', true);
       throw error;
     } finally {
       textSync = null;
@@ -149,8 +147,7 @@ function queueTextSync() {
 
 function syncText() {
   queueTextSync().catch(() => {
-    // The save button sends the full text directly, so a failed autosave does
-    // not lose the note. Keep the failure visible without flooding the page.
+    showError('The draft could not be saved. It will retry with the next words.');
   });
 }
 
@@ -158,26 +155,7 @@ async function flushText() {
   try {
     await queueTextSync();
   } catch {
-    // Saving the draft carries the current text regardless.
-  }
-}
-
-function scheduleNameSync() {
-  if (!draftId || !nameEl) return;
-  clearTimeout(nameTimer);
-  nameTimer = setTimeout(syncName, 600);
-}
-
-async function syncName() {
-  if (!draftId || !nameEl) return;
-  const name = nameEl.value;
-  if (name === savedName) return;
-  try {
-    await putDraft({ name });
-    savedName = name;
-    setDraftStatus('Draft saved');
-  } catch {
-    setDraftStatus('Draft name not saved', true);
+    // Saving the note carries the current text regardless.
   }
 }
 
@@ -197,11 +175,7 @@ async function getSpeech() {
         model: MODEL_URL,
         modelSha256: MODEL_SHA256,
         cache: true,
-        onDownloadProgress: progress => {
-          const suffix =
-            progress?.percentage == null ? '' : ' ' + Math.round(progress.percentage) + '%';
-          setStatus('Loading speech model…' + suffix);
-        }
+        onDownloadProgress: progress => setLoading(progress?.percentage ?? 0)
       });
       speech = session;
       return session;
@@ -245,24 +219,23 @@ async function startDictation() {
   }
 
   mic.disabled = true;
-  setStatus(draftId ? 'Loading speech model…' : 'Creating draft…');
+  setLoading(0);
 
   try {
     await ensureDraft();
   } catch (error) {
     mic.disabled = false;
-    setStatus(idleStatus());
+    setLoading(null);
     showError(describe(error));
     return;
   }
 
-  setStatus('Loading speech model…');
   let session;
   try {
     session = await getSpeech();
   } catch (error) {
     mic.disabled = false;
-    setStatus(idleStatus());
+    setLoading(null);
     showError(describe(error));
     return;
   }
@@ -279,7 +252,7 @@ async function startDictation() {
     });
   } catch {
     mic.disabled = false;
-    setStatus(idleStatus());
+    setLoading(null);
     showError('Microphone access was blocked. Allow it and try again.');
     return;
   }
@@ -300,7 +273,7 @@ async function startDictation() {
     stream.getTracks().forEach(track => track.stop());
     ctx?.close().catch(() => {});
     mic.disabled = false;
-    setStatus(idleStatus());
+    setLoading(null);
     showError('Could not start audio capture: ' + describe(error));
     return;
   }
@@ -349,10 +322,10 @@ async function startDictation() {
     state.loopError = error;
   });
 
+  setLoading(null);
   mic.disabled = false;
   mic.classList.add('recording');
   mic.setAttribute('aria-label', 'Pause dictation');
-  setStatus('Listening… tap to pause');
   if (timerEl) {
     timerEl.hidden = false;
     timerEl.textContent = '00:00';
@@ -366,7 +339,6 @@ async function stopDictation() {
   if (!state || state.stopping) return;
   state.stopping = true;
   mic.disabled = true;
-  setStatus('Finishing…');
   clearInterval(state.timer);
 
   try {
@@ -416,7 +388,6 @@ async function stopDictation() {
 
   committed = committed.trim();
   render();
-  setStatus(idleStatus());
 
   // Do not save here: stopping simply pauses. Persist the draft so a reload or
   // closed tab cannot lose what has already been transcribed.
@@ -429,23 +400,23 @@ async function stopDictation() {
 async function saveCurrentDraft() {
   if (!draftId || recorder) return;
   clearError();
-  setStatus('Saving…');
   if (saveEl) saveEl.disabled = true;
   if (discardEl) discardEl.disabled = true;
-  if (nameEl) nameEl.disabled = true;
 
   await flushText();
 
   let response;
   try {
-    response = await fetch('/api/drafts/' + draftId + '/save', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: committed })
-    });
+    response = await fetch(
+      '/api/drafts/' + encodeURIComponent(draftId) + '/save',
+      {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: committed })
+      }
+    );
   } catch {
-    setStatus(idleStatus());
     showError('Could not reach the server. Your draft is still available.');
     updateActions();
     return;
@@ -453,19 +424,17 @@ async function saveCurrentDraft() {
 
   if (response.ok) {
     const saved = await response.json().catch(() => null);
-    if (saved?.id) {
+    if (typeof saved?.id === 'string' && saved.id) {
       textPending = false;
       window.location.assign('/dictations/' + encodeURIComponent(saved.id));
       return;
     }
-    setStatus(idleStatus());
     showError('The server returned an unexpected response. Your draft is still available.');
     updateActions();
     return;
   }
 
   const error = await apiError(response);
-  setStatus(idleStatus());
   showError(describe(error));
   updateActions();
 }
@@ -479,7 +448,7 @@ async function discardCurrentDraft() {
 
   let response;
   try {
-    response = await fetch('/api/drafts/' + draftId, {
+    response = await fetch('/api/drafts/' + encodeURIComponent(draftId), {
       method: 'DELETE',
       credentials: 'same-origin'
     });
@@ -517,12 +486,8 @@ if (discardEl) {
   discardEl.addEventListener('click', discardCurrentDraft);
 }
 
-if (nameEl) {
-  nameEl.addEventListener('input', scheduleNameSync);
-  nameEl.addEventListener('blur', () => {
-    clearTimeout(nameTimer);
-    syncName();
-  });
+if (errorEl) {
+  errorEl.addEventListener('click', clearError);
 }
 
 window.addEventListener('beforeunload', event => {
@@ -535,7 +500,6 @@ window.addEventListener('beforeunload', event => {
 // drafts all continue from the same text.
 committed = committed.trim();
 render();
-setStatus(idleStatus());
 
 // Localize UTC timestamps when JavaScript is available.
 for (const el of document.querySelectorAll('time[data-local]')) {

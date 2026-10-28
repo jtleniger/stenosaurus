@@ -1,28 +1,25 @@
 //! SQLite-backed dictation storage.
 //!
-//! Notes live in the `notes` table of the shared [`Database`]. Ids keep the
-//! timestamp form used in URLs and are unique; notes sharing a timestamp get
-//! a `-<sequence>` suffix.
+//! Notes live in the `notes` table of the shared [`Database`]. Notes and
+//! drafts are identified by UUIDs, and timestamps are stored as ISO 8601 UTC
+//! strings. The fixed-width format sorts chronologically as plain text.
 
 use regex::{Regex, RegexBuilder};
 use rusqlite::{params, params_from_iter, OptionalExtension};
 use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+use uuid::Uuid;
 
 use crate::db::Database;
 
-/// Filename timestamp, e.g. `2026-10-20T12-34-56.123456Z`.
-pub const FILE_FORMAT: &[BorrowedFormatItem<'static>] =
-    format_description!("[year]-[month]-[day]T[hour]-[minute]-[second].[subsecond digits:6]Z");
-/// Machine-readable timestamp used in `<time datetime="...">`.
+/// Stored timestamp, e.g. `2026-10-20T12:34:56.123456Z`.
 pub const ISO_FORMAT: &[BorrowedFormatItem<'static>] =
-    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z");
 /// Human-readable UTC timestamp for no-JS rendering.
 pub const DISPLAY_FORMAT: &[BorrowedFormatItem<'static>] =
     format_description!("[day] [month repr:short] [year], [hour]:[minute] UTC");
 
-const MAX_SEQUENCE: u32 = 1000;
 const PREVIEW_CHARS: usize = 140;
 const SNIPPET_BEFORE_CHARS: usize = 60;
 const SNIPPET_AFTER_CHARS: usize = 120;
@@ -48,46 +45,20 @@ pub struct Dictation {
 /// An in-progress note that has not been saved to the notes list yet.
 #[derive(Debug, Clone)]
 pub struct Draft {
-    pub id: i64,
-    pub name: String,
+    pub id: String,
     pub text: String,
-    /// Microseconds since the epoch; the draft's note timestamp when saved.
-    pub created_at: i64,
+    /// ISO timestamp the note will keep when saved.
     pub created_iso: String,
     pub created_display: String,
-    pub updated_iso: String,
-    pub updated_display: String,
-}
-
-impl Draft {
-    /// Human-readable label for the draft list.
-    pub fn label(&self) -> &str {
-        if self.name.is_empty() {
-            "Untitled draft"
-        } else {
-            &self.name
-        }
-    }
 }
 
 /// A draft as shown in the draft list.
 #[derive(Debug, Clone)]
 pub struct DraftSummary {
-    pub id: i64,
-    pub name: String,
+    pub id: String,
     pub preview: String,
-    pub updated_iso: String,
-    pub updated_display: String,
-}
-
-impl DraftSummary {
-    pub fn label(&self) -> &str {
-        if self.name.is_empty() {
-            "Untitled draft"
-        } else {
-            &self.name
-        }
-    }
+    pub created_iso: String,
+    pub created_display: String,
 }
 
 /// One run of snippet text, highlighted when it matches the query.
@@ -121,10 +92,8 @@ pub enum StoreError {
     Empty,
     #[error("timestamp formatting error: {0}")]
     Format(#[from] time::error::Format),
-    #[error("invalid timestamp: {0}")]
-    Timestamp(#[from] time::error::ComponentRange),
-    #[error("too many dictations share this timestamp")]
-    Exhausted,
+    #[error("invalid stored timestamp: {0}")]
+    Parse(#[from] time::error::Parse),
     #[error("draft not found")]
     NotFound,
 }
@@ -150,47 +119,32 @@ impl DictationStore {
         at: OffsetDateTime,
         text: &str,
     ) -> Result<Dictation, StoreError> {
-        let text = text.trim();
-        if text.is_empty() {
+        let body = text.trim().to_string();
+        if body.is_empty() {
             return Err(StoreError::Empty);
         }
-        let (base, iso, display) = render(at)?;
-        let recorded_at = to_micros(at);
-        let body = text.to_string();
-        let body_lower = body.to_lowercase();
-
-        for sequence in 0..MAX_SEQUENCE {
-            let id = if sequence == 0 {
-                base.clone()
-            } else {
-                format!("{base}-{sequence}")
-            };
-            let insert_id = id.clone();
-            let insert_body = body.clone();
-            let insert_lower = body_lower.clone();
-            let inserted = self
-                .db
-                .call(move |conn| {
-                    insert_note(
-                        conn,
-                        &insert_id,
-                        recorded_at,
-                        sequence,
-                        &insert_body,
-                        &insert_lower,
-                    )
-                })
-                .await?;
-            if inserted {
-                return Ok(Dictation {
-                    id,
-                    iso,
-                    display,
-                    text: body,
-                });
-            }
-        }
-        Err(StoreError::Exhausted)
+        let (iso, display) = render(at)?;
+        let id = Uuid::new_v4().to_string();
+        let insert_id = id.clone();
+        let insert_iso = iso.clone();
+        let insert_lower = body.to_lowercase();
+        let insert_body = body.clone();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO notes (id, created_at, text, text_lower)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![insert_id, insert_iso, insert_body, insert_lower],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(Dictation {
+            id,
+            iso,
+            display,
+            text: body,
+        })
     }
 
     /// All dictations, newest first.
@@ -198,15 +152,13 @@ impl DictationStore {
         let rows = self
             .db
             .call(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, recorded_at, text FROM notes
-                     ORDER BY recorded_at DESC, sequence DESC",
-                )?;
+                let mut stmt = conn
+                    .prepare("SELECT id, created_at, text FROM notes ORDER BY created_at DESC")?;
                 let rows = stmt
                     .query_map([], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                         ))
                     })?
@@ -216,12 +168,11 @@ impl DictationStore {
             .await?;
 
         let mut summaries = Vec::with_capacity(rows.len());
-        for (id, recorded_at, text) in rows {
-            let at = from_micros(recorded_at)?;
-            let (_, iso, display) = render(at)?;
+        for (id, created_at, text) in rows {
+            let display = display_timestamp(&created_at)?;
             summaries.push(DictationSummary {
                 id,
-                iso,
+                iso: created_at,
                 display,
                 preview: preview(&text),
             });
@@ -259,17 +210,17 @@ impl DictationStore {
         let rows = self
             .db
             .call(move |conn| {
-                let mut sql = String::from("SELECT id, recorded_at, text FROM notes WHERE 1 = 1");
+                let mut sql = String::from("SELECT id, created_at, text FROM notes WHERE 1 = 1");
                 for _ in &terms {
                     sql.push_str(" AND instr(text_lower, ?) > 0");
                 }
-                sql.push_str(" ORDER BY recorded_at DESC, sequence DESC");
+                sql.push_str(" ORDER BY created_at DESC");
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt
                     .query_map(params_from_iter(terms.iter()), |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                         ))
                     })?
@@ -280,17 +231,16 @@ impl DictationStore {
 
         let mut total = 0;
         let mut hits = Vec::new();
-        for (id, recorded_at, text) in rows {
+        for (id, created_at, text) in rows {
             if !patterns.iter().all(|pattern| pattern.is_match(&text)) {
                 continue;
             }
             total += 1;
             if hits.len() < limit {
-                let at = from_micros(recorded_at)?;
-                let (_, iso, display) = render(at)?;
+                let display = display_timestamp(&created_at)?;
                 hits.push(SearchHit {
                     id,
-                    iso,
+                    iso: created_at,
                     display,
                     snippet: snippet(&text, &patterns),
                 });
@@ -306,64 +256,62 @@ impl DictationStore {
             .db
             .call(move |conn| {
                 conn.query_row(
-                    "SELECT recorded_at, text FROM notes WHERE id = ?1",
+                    "SELECT created_at, text FROM notes WHERE id = ?1",
                     params![lookup],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()
             })
             .await?;
-        let Some((recorded_at, text)) = row else {
+        let Some((created_at, text)) = row else {
             return Ok(None);
         };
-        let at = from_micros(recorded_at)?;
-        let (_, iso, display) = render(at)?;
+        let display = display_timestamp(&created_at)?;
         Ok(Some(Dictation {
             id: id.to_string(),
-            iso,
+            iso: created_at,
             display,
             text,
         }))
     }
 
     /// Create an empty draft and return its id.
-    pub async fn create_draft(&self) -> Result<i64, StoreError> {
+    pub async fn create_draft(&self) -> Result<String, StoreError> {
         self.create_draft_at(OffsetDateTime::now_utc()).await
     }
 
     /// Create an empty draft with an explicit start time; used by tests.
-    pub(crate) async fn create_draft_at(&self, at: OffsetDateTime) -> Result<i64, StoreError> {
-        let created_at = to_micros(at);
-        let id = self
-            .db
+    pub(crate) async fn create_draft_at(&self, at: OffsetDateTime) -> Result<String, StoreError> {
+        let id = Uuid::new_v4().to_string();
+        let (created_at, _) = render(at)?;
+        let insert_id = id.clone();
+        self.db
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO drafts (name, created_at, updated_at, text)
-                     VALUES ('', ?1, ?1, '')",
-                    params![created_at],
+                    "INSERT INTO drafts (id, created_at, text) VALUES (?1, ?2, '')",
+                    params![insert_id, created_at],
                 )?;
-                Ok(conn.last_insert_rowid())
+                Ok(())
             })
             .await?;
         Ok(id)
     }
 
-    /// All drafts, most recently edited first.
+    /// All drafts, newest first.
     pub async fn list_drafts(&self) -> Result<Vec<DraftSummary>, StoreError> {
         let rows = self
             .db
             .call(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, name, updated_at, substr(text, 1, 400) FROM drafts
-                     ORDER BY updated_at DESC, id DESC",
+                    "SELECT id, created_at, substr(text, 1, 400) FROM drafts
+                     ORDER BY created_at DESC",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
                         Ok((
-                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(2)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -372,66 +320,52 @@ impl DictationStore {
             .await?;
 
         let mut drafts = Vec::with_capacity(rows.len());
-        for (id, name, updated_at, text) in rows {
-            let updated = from_micros(updated_at)?;
-            let (_, updated_iso, updated_display) = render(updated)?;
+        for (id, created_at, text) in rows {
+            let created_display = display_timestamp(&created_at)?;
             drafts.push(DraftSummary {
                 id,
-                name,
                 preview: preview(&text),
-                updated_iso,
-                updated_display,
+                created_iso: created_at,
+                created_display,
             });
         }
         Ok(drafts)
     }
 
     /// Load one draft; unknown ids are `None`.
-    pub async fn get_draft(&self, id: i64) -> Result<Option<Draft>, StoreError> {
+    pub async fn get_draft(&self, id: &str) -> Result<Option<Draft>, StoreError> {
+        let lookup = id.to_string();
         let row = self
             .db
             .call(move |conn| {
                 conn.query_row(
-                    "SELECT name, created_at, updated_at, text FROM drafts WHERE id = ?1",
-                    params![id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    },
+                    "SELECT created_at, text FROM drafts WHERE id = ?1",
+                    params![lookup],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()
             })
             .await?;
-        let Some((name, created_at, updated_at, text)) = row else {
+        let Some((created_at, text)) = row else {
             return Ok(None);
         };
-        render_draft(id, name, created_at, updated_at, text).map(Some)
+        render_draft(id.to_string(), created_at, text).map(Some)
     }
 
-    /// Replace the supplied draft fields and bump its edit time.
+    /// Replace the draft text.
     pub async fn update_draft(
         &self,
-        id: i64,
-        name: Option<String>,
+        id: &str,
         text: Option<String>,
     ) -> Result<Option<Draft>, StoreError> {
-        let name = name.map(|name| name.trim().to_string());
         let text = text.map(|text| text.trim().to_string());
-        let updated_at = to_micros(OffsetDateTime::now_utc());
+        let lookup = id.to_string();
         let changed = self
             .db
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE drafts
-                     SET name = COALESCE(?2, name),
-                         text = COALESCE(?3, text),
-                         updated_at = ?4
-                     WHERE id = ?1",
-                    params![id, name, text, updated_at],
+                    "UPDATE drafts SET text = COALESCE(?2, text) WHERE id = ?1",
+                    params![lookup, text],
                 )
             })
             .await?;
@@ -442,10 +376,11 @@ impl DictationStore {
     }
 
     /// Delete a draft; false when it was already gone.
-    pub async fn delete_draft(&self, id: i64) -> Result<bool, StoreError> {
+    pub async fn delete_draft(&self, id: &str) -> Result<bool, StoreError> {
+        let lookup = id.to_string();
         let deleted = self
             .db
-            .call(move |conn| conn.execute("DELETE FROM drafts WHERE id = ?1", params![id]))
+            .call(move |conn| conn.execute("DELETE FROM drafts WHERE id = ?1", params![lookup]))
             .await?;
         Ok(deleted > 0)
     }
@@ -455,7 +390,7 @@ impl DictationStore {
     /// `text` overrides the stored draft body so a save still succeeds when the
     /// last background autosave failed. The note is dated from the draft's
     /// creation, not from the moment Save was pressed.
-    pub async fn save_draft(&self, id: i64, text: Option<&str>) -> Result<Dictation, StoreError> {
+    pub async fn save_draft(&self, id: &str, text: Option<&str>) -> Result<Dictation, StoreError> {
         let Some(draft) = self.get_draft(id).await? else {
             return Err(StoreError::NotFound);
         };
@@ -466,133 +401,64 @@ impl DictationStore {
         if body.is_empty() {
             return Err(StoreError::Empty);
         }
-        let at = from_micros(draft.created_at)?;
-        let (base, iso, display) = render(at)?;
-        let recorded_at = draft.created_at;
-        let body_lower = body.to_lowercase();
-        let base_for_call = base.clone();
-        let body_for_call = body.clone();
-
-        let outcome = self
+        let note_id = Uuid::new_v4().to_string();
+        let lookup = id.to_string();
+        let insert_id = note_id.clone();
+        let insert_iso = draft.created_iso.clone();
+        let insert_body = body.clone();
+        let insert_lower = body.to_lowercase();
+        let removed = self
             .db
             .call(move |conn| {
                 let tx = conn.transaction()?;
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM drafts WHERE id = ?1)",
-                    params![id],
-                    |row| row.get(0),
+                let deleted = tx.execute("DELETE FROM drafts WHERE id = ?1", params![lookup])?;
+                if deleted == 0 {
+                    return Ok(false);
+                }
+                tx.execute(
+                    "INSERT INTO notes (id, created_at, text, text_lower)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![insert_id, insert_iso, insert_body, insert_lower],
                 )?;
-                if !exists {
-                    return Ok(PromoteOutcome::Missing);
-                }
-                for sequence in 0..MAX_SEQUENCE {
-                    let note_id = if sequence == 0 {
-                        base_for_call.clone()
-                    } else {
-                        format!("{base_for_call}-{sequence}")
-                    };
-                    if insert_note(
-                        &tx,
-                        &note_id,
-                        recorded_at,
-                        sequence,
-                        &body_for_call,
-                        &body_lower,
-                    )? {
-                        tx.execute("DELETE FROM drafts WHERE id = ?1", params![id])?;
-                        tx.commit()?;
-                        return Ok(PromoteOutcome::Saved(note_id));
-                    }
-                }
-                Ok(PromoteOutcome::Exhausted)
+                tx.commit()?;
+                Ok(true)
             })
             .await?;
-
-        match outcome {
-            PromoteOutcome::Saved(note_id) => Ok(Dictation {
-                id: note_id,
-                iso,
-                display,
-                text: body,
-            }),
-            PromoteOutcome::Missing => Err(StoreError::NotFound),
-            PromoteOutcome::Exhausted => Err(StoreError::Exhausted),
+        if !removed {
+            return Err(StoreError::NotFound);
         }
+        Ok(Dictation {
+            id: note_id,
+            iso: draft.created_iso,
+            display: draft.created_display,
+            text: body,
+        })
     }
 }
 
-enum PromoteOutcome {
-    Saved(String),
-    Missing,
-    Exhausted,
-}
-
-fn insert_note(
-    conn: &rusqlite::Connection,
-    id: &str,
-    recorded_at: i64,
-    sequence: u32,
-    body: &str,
-    body_lower: &str,
-) -> rusqlite::Result<bool> {
-    let result = conn.execute(
-        "INSERT INTO notes (id, recorded_at, sequence, text, text_lower)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, recorded_at, sequence, body, body_lower],
-    );
-    match result {
-        Ok(_) => Ok(true),
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            Ok(false)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn render_draft(
-    id: i64,
-    name: String,
-    created_at: i64,
-    updated_at: i64,
-    text: String,
-) -> Result<Draft, StoreError> {
-    let created = from_micros(created_at)?;
-    let updated = from_micros(updated_at)?;
-    let (_, created_iso, created_display) = render(created)?;
-    let (_, updated_iso, updated_display) = render(updated)?;
+fn render_draft(id: String, created_iso: String, text: String) -> Result<Draft, StoreError> {
+    let created_display = display_timestamp(&created_iso)?;
     Ok(Draft {
         id,
-        name,
         text,
-        created_at,
         created_iso,
         created_display,
-        updated_iso,
-        updated_display,
     })
 }
 
-/// Format the same instant as a filename stem, ISO timestamp and display string.
-fn render(at: OffsetDateTime) -> Result<(String, String, String), StoreError> {
+/// Format the same instant as the stored ISO timestamp and display string.
+fn render(at: OffsetDateTime) -> Result<(String, String), StoreError> {
     let at = at.to_offset(UtcOffset::UTC);
     let primitive = PrimitiveDateTime::new(at.date(), at.time());
     Ok((
-        primitive.format(FILE_FORMAT)?,
         primitive.format(ISO_FORMAT)?,
         primitive.format(DISPLAY_FORMAT)?,
     ))
 }
 
-fn to_micros(at: OffsetDateTime) -> i64 {
-    (at.unix_timestamp_nanos() / 1000) as i64
-}
-
-fn from_micros(micros: i64) -> Result<OffsetDateTime, StoreError> {
-    Ok(OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(micros) * 1000,
-    )?)
+/// Human-readable form of a stored ISO timestamp.
+fn display_timestamp(iso: &str) -> Result<String, StoreError> {
+    Ok(PrimitiveDateTime::parse(iso, ISO_FORMAT)?.format(DISPLAY_FORMAT)?)
 }
 
 /// Collapse whitespace and shorten to a one-line preview.
@@ -727,25 +593,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saves_timestamp_id_and_text() {
+    async fn saves_uuid_id_iso_timestamp_and_text() {
         let (_guard, store) = store().await;
         let at = datetime!(2026-10-20 12:34:56.123456 UTC);
         let saved = store.save_at(at, "hello world").await.unwrap();
-        assert_eq!(saved.id, "2026-10-20T12-34-56.123456Z");
-        assert_eq!(saved.iso, "2026-10-20T12:34:56Z");
+        assert!(Uuid::parse_str(&saved.id).is_ok(), "id was {}", saved.id);
+        assert_eq!(saved.iso, "2026-10-20T12:34:56.123456Z");
         assert_eq!(saved.display, "20 Oct 2026, 12:34 UTC");
         let loaded = store.get(&saved.id).await.unwrap().unwrap();
         assert_eq!(loaded.text, "hello world");
+        assert_eq!(loaded.iso, saved.iso);
+        assert_eq!(loaded.display, saved.display);
     }
 
     #[tokio::test]
-    async fn same_timestamp_gets_sequence_suffix() {
+    async fn notes_saved_at_the_same_instant_get_distinct_ids() {
         let (_guard, store) = store().await;
         let at = datetime!(2026-10-20 12:34:56.123456 UTC);
         let first = store.save_at(at, "first").await.unwrap();
         let second = store.save_at(at, "second").await.unwrap();
-        assert_eq!(first.id, "2026-10-20T12-34-56.123456Z");
-        assert_eq!(second.id, "2026-10-20T12-34-56.123456Z-1");
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.iso, second.iso);
         assert_eq!(store.get(&first.id).await.unwrap().unwrap().text, "first");
         assert_eq!(store.get(&second.id).await.unwrap().unwrap().text, "second");
     }
@@ -762,21 +630,22 @@ mod tests {
             .await
             .unwrap();
         let list = store.list().await.unwrap();
-        let ids: Vec<&str> = list.iter().map(|d| d.id.as_str()).collect();
+        let isos: Vec<&str> = list.iter().map(|d| d.iso.as_str()).collect();
         assert_eq!(
-            ids,
-            ["2026-10-21T09-15-00.000000Z", "2026-10-20T12-00-00.000000Z"]
+            isos,
+            ["2026-10-21T09:15:00.000000Z", "2026-10-20T12:00:00.000000Z"]
         );
         assert_eq!(list[0].preview, "newer");
+        assert_eq!(list[0].display, "21 Oct 2026, 09:15 UTC");
     }
 
     #[tokio::test]
-    async fn rejects_invalid_ids() {
+    async fn rejects_unknown_ids() {
         let (_guard, store) = store().await;
         assert!(store.get("../x").await.unwrap().is_none());
         assert!(store.get("not-an-id").await.unwrap().is_none());
         assert!(store
-            .get("2026-10-20T12-34-56.123456Z")
+            .get("d5c0d0ee-7b1b-4c8f-9f0a-3a1a2b3c4d5e")
             .await
             .unwrap()
             .is_none());
@@ -945,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drafts_are_named_updated_and_deleted() {
+    async fn drafts_are_created_updated_and_deleted() {
         let (_guard, store) = store().await;
         let first = store
             .create_draft_at(datetime!(2026-10-20 12:00:00 UTC))
@@ -955,32 +824,31 @@ mod tests {
             .create_draft_at(datetime!(2026-10-20 12:01:00 UTC))
             .await
             .unwrap();
+        assert!(Uuid::parse_str(&first).is_ok(), "id was {first}");
+        assert_ne!(first, second);
 
         let updated = store
-            .update_draft(
-                first,
-                Some("  Shopping  ".to_string()),
-                Some("  milk  ".to_string()),
-            )
+            .update_draft(&first, Some("  milk  ".to_string()))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(updated.name, "Shopping");
         assert_eq!(updated.text, "milk");
-        assert_eq!(updated.created_iso, "2026-10-20T12:00:00Z");
+        assert_eq!(updated.created_iso, "2026-10-20T12:00:00.000000Z");
+        assert_eq!(updated.created_display, "20 Oct 2026, 12:00 UTC");
 
         let list = store.list_drafts().await.unwrap();
         assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, second);
         let first_summary = list.iter().find(|draft| draft.id == first).unwrap();
-        assert_eq!(first_summary.label(), "Shopping");
         assert_eq!(first_summary.preview, "milk");
+        assert_eq!(first_summary.created_display, "20 Oct 2026, 12:00 UTC");
 
-        assert!(store.delete_draft(first).await.unwrap());
-        assert!(!store.delete_draft(first).await.unwrap());
-        assert!(store.get_draft(first).await.unwrap().is_none());
-        assert!(store.get_draft(second).await.unwrap().is_some());
+        assert!(store.delete_draft(&first).await.unwrap());
+        assert!(!store.delete_draft(&first).await.unwrap());
+        assert!(store.get_draft(&first).await.unwrap().is_none());
+        assert!(store.get_draft(&second).await.unwrap().is_some());
         assert!(store
-            .update_draft(first, Some("x".into()), None)
+            .update_draft(&first, Some("x".into()))
             .await
             .unwrap()
             .is_none());
@@ -992,19 +860,16 @@ mod tests {
         let at = datetime!(2026-10-20 12:34:56.123456 UTC);
         let id = store.create_draft_at(at).await.unwrap();
         store
-            .update_draft(
-                id,
-                Some("Note".to_string()),
-                Some("hello draft".to_string()),
-            )
+            .update_draft(&id, Some("hello draft".to_string()))
             .await
             .unwrap();
 
-        let saved = store.save_draft(id, None).await.unwrap();
-        assert_eq!(saved.id, "2026-10-20T12-34-56.123456Z");
-        assert_eq!(saved.iso, "2026-10-20T12:34:56Z");
+        let saved = store.save_draft(&id, None).await.unwrap();
+        assert!(Uuid::parse_str(&saved.id).is_ok(), "id was {}", saved.id);
+        assert_eq!(saved.iso, "2026-10-20T12:34:56.123456Z");
+        assert_eq!(saved.display, "20 Oct 2026, 12:34 UTC");
         assert_eq!(saved.text, "hello draft");
-        assert!(store.get_draft(id).await.unwrap().is_none());
+        assert!(store.get_draft(&id).await.unwrap().is_none());
         assert_eq!(store.list().await.unwrap().len(), 1);
         assert_eq!(store.list_drafts().await.unwrap().len(), 0);
     }
@@ -1017,13 +882,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_draft(id, None, Some("old autosave".to_string()))
+            .update_draft(&id, Some("old autosave".to_string()))
             .await
             .unwrap();
 
-        let saved = store.save_draft(id, Some("newer text")).await.unwrap();
+        let saved = store.save_draft(&id, Some("newer text")).await.unwrap();
         assert_eq!(saved.text, "newer text");
-        assert!(store.get_draft(id).await.unwrap().is_none());
+        assert!(store.get_draft(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1034,43 +899,45 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            store.save_draft(id, None).await,
+            store.save_draft(&id, None).await,
             Err(StoreError::Empty)
         ));
         assert!(matches!(
-            store.save_draft(id, Some("   ")).await,
+            store.save_draft(&id, Some("   ")).await,
             Err(StoreError::Empty)
         ));
-        assert!(store.get_draft(id).await.unwrap().is_some());
+        assert!(store.get_draft(&id).await.unwrap().is_some());
         assert!(store.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn saved_draft_shares_timestamp_with_existing_note() {
+    async fn saved_draft_keeps_its_timestamp_when_a_note_shares_it() {
         let (_guard, store) = store().await;
         let at = datetime!(2026-10-20 12:00:00 UTC);
-        store.save_at(at, "existing").await.unwrap();
+        let existing = store.save_at(at, "existing").await.unwrap();
         let id = store.create_draft_at(at).await.unwrap();
         store
-            .update_draft(id, None, Some("draft".to_string()))
+            .update_draft(&id, Some("draft".to_string()))
             .await
             .unwrap();
-        let saved = store.save_draft(id, None).await.unwrap();
-        assert_eq!(saved.id, "2026-10-20T12-00-00.000000Z-1");
+        let saved = store.save_draft(&id, None).await.unwrap();
+        assert_ne!(saved.id, existing.id);
+        assert_eq!(saved.iso, existing.iso);
+        assert_eq!(store.list().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn unknown_draft_operations_fail() {
         let (_guard, store) = store().await;
         assert!(matches!(
-            store.save_draft(99, Some("text")).await,
+            store.save_draft("missing", Some("text")).await,
             Err(StoreError::NotFound)
         ));
         assert!(store
-            .update_draft(99, Some("x".into()), None)
+            .update_draft("missing", Some("x".into()))
             .await
             .unwrap()
             .is_none());
-        assert!(!store.delete_draft(99).await.unwrap());
+        assert!(!store.delete_draft("missing").await.unwrap());
     }
 }
