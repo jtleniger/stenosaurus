@@ -105,7 +105,7 @@ async function ensureDraft() {
   if (!Number.isFinite(draftId)) throw new Error('The server returned an unexpected response.');
   if (recorderEl) recorderEl.dataset.draftId = String(draftId);
   savedName = '';
-  window.history.replaceState(null, '', '/drafts/' + draftId);
+  window.history.replaceState(null, '', '/?draft=' + draftId);
   setDraftStatus('');
   updateActions();
   return draftId;

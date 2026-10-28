@@ -34,12 +34,15 @@ base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
 #[derive(Template, WebTemplate)]
 #[template(path = "index.html")]
 struct IndexTemplate {
+    username: String,
+    draft: Option<Draft>,
     query: String,
 }
 
 #[derive(Template, WebTemplate)]
 #[template(path = "notes.html")]
 struct NotesTemplate {
+    username: String,
     dictations: Vec<DictationSummary>,
     empty: bool,
 }
@@ -47,13 +50,8 @@ struct NotesTemplate {
 #[derive(Template, WebTemplate)]
 #[template(path = "drafts.html")]
 struct DraftsTemplate {
+    username: String,
     drafts: Vec<DraftSummary>,
-}
-
-#[derive(Template, WebTemplate)]
-#[template(path = "recorder.html")]
-struct RecorderTemplate {
-    draft: Draft,
 }
 
 #[derive(Template, WebTemplate)]
@@ -65,6 +63,7 @@ struct LoginTemplate {
 #[derive(Template, WebTemplate)]
 #[template(path = "dictation.html")]
 struct DictationTemplate {
+    username: String,
     iso: String,
     display: String,
     text: String,
@@ -73,6 +72,7 @@ struct DictationTemplate {
 #[derive(Template, WebTemplate)]
 #[template(path = "search.html")]
 struct SearchTemplate {
+    username: String,
     query: String,
     hits: Vec<SearchHit>,
     total: usize,
@@ -84,6 +84,11 @@ struct SearchTemplate {
 struct LoginForm {
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct IndexParams {
+    draft: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -168,46 +173,66 @@ impl FromRequestParts<AppState> for ApiUser {
     }
 }
 
-async fn index(AuthedUser(_): AuthedUser) -> IndexTemplate {
-    IndexTemplate {
+async fn index(
+    State(state): State<AppState>,
+    AuthedUser(username): AuthedUser,
+    Query(params): Query<IndexParams>,
+) -> Result<IndexTemplate, PageError> {
+    let drafts = state.store.list_drafts().await.map_err(|err| {
+        tracing::error!(%err, "could not list drafts");
+        PageError::internal()
+    })?;
+
+    let draft = match params.draft.as_deref() {
+        Some(raw) => {
+            let id = raw.parse::<i64>().map_err(|_| PageError::not_found())?;
+            let draft = state.store.get_draft(id).await.map_err(|err| {
+                tracing::error!(%err, "could not read draft");
+                PageError::internal()
+            })?;
+            Some(draft.ok_or_else(PageError::not_found)?)
+        }
+        None => match drafts.first() {
+            Some(latest) => state.store.get_draft(latest.id).await.map_err(|err| {
+                tracing::error!(%err, "could not read draft");
+                PageError::internal()
+            })?,
+            None => None,
+        },
+    };
+
+    Ok(IndexTemplate {
+        username,
+        draft,
         query: String::new(),
-    }
+    })
 }
 
 async fn notes(
     State(state): State<AppState>,
-    AuthedUser(_): AuthedUser,
+    AuthedUser(username): AuthedUser,
 ) -> Result<NotesTemplate, PageError> {
     let dictations = state.store.list().await.map_err(|err| {
         tracing::error!(%err, "could not list dictations");
         PageError::internal()
     })?;
     let empty = dictations.is_empty();
-    Ok(NotesTemplate { dictations, empty })
+    Ok(NotesTemplate {
+        username,
+        dictations,
+        empty,
+    })
 }
 
 async fn drafts_page(
     State(state): State<AppState>,
-    AuthedUser(_): AuthedUser,
+    AuthedUser(username): AuthedUser,
 ) -> Result<DraftsTemplate, PageError> {
     let drafts = state.store.list_drafts().await.map_err(|err| {
         tracing::error!(%err, "could not list drafts");
         PageError::internal()
     })?;
-    Ok(DraftsTemplate { drafts })
-}
-
-async fn show_draft(
-    State(state): State<AppState>,
-    AuthedUser(_): AuthedUser,
-    Path(id): Path<i64>,
-) -> Result<RecorderTemplate, PageError> {
-    let draft = state.store.get_draft(id).await.map_err(|err| {
-        tracing::error!(%err, "could not read draft");
-        PageError::internal()
-    })?;
-    let draft = draft.ok_or_else(PageError::not_found)?;
-    Ok(RecorderTemplate { draft })
+    Ok(DraftsTemplate { username, drafts })
 }
 
 async fn login_page(session: Session) -> Result<Response, PageError> {
@@ -266,7 +291,7 @@ async fn logout(AuthedUser(_): AuthedUser, session: Session) -> Result<Redirect,
 
 async fn show_dictation(
     State(state): State<AppState>,
-    AuthedUser(_): AuthedUser,
+    AuthedUser(username): AuthedUser,
     Path(id): Path<String>,
 ) -> Result<DictationTemplate, PageError> {
     let Some(dictation) = state.store.get(&id).await.map_err(|err| {
@@ -277,6 +302,7 @@ async fn show_dictation(
         return Err(PageError::not_found());
     };
     Ok(DictationTemplate {
+        username,
         iso: dictation.iso,
         display: dictation.display,
         text: dictation.text,
@@ -285,7 +311,7 @@ async fn show_dictation(
 
 async fn search(
     State(state): State<AppState>,
-    AuthedUser(_): AuthedUser,
+    AuthedUser(username): AuthedUser,
     Query(params): Query<SearchParams>,
 ) -> Result<Response, PageError> {
     let query = params.q.unwrap_or_default();
@@ -304,6 +330,7 @@ async fn search(
     let truncated = results.total > results.hits.len();
     let empty = results.hits.is_empty();
     Ok(SearchTemplate {
+        username,
         query: query.to_string(),
         hits: results.hits,
         total: results.total,
@@ -322,17 +349,6 @@ async fn create_draft(
         ApiError::internal()
     })?;
     Ok((StatusCode::CREATED, Json(CreatedDraft { id })))
-}
-
-async fn new_draft_page(
-    State(state): State<AppState>,
-    AuthedUser(_): AuthedUser,
-) -> Result<Redirect, PageError> {
-    let id = state.store.create_draft().await.map_err(|err| {
-        tracing::error!(%err, "could not create draft");
-        PageError::internal()
-    })?;
-    Ok(Redirect::to(&format!("/drafts/{id}")))
 }
 
 async fn update_draft(
@@ -496,10 +512,8 @@ pub fn app(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/notes", get(notes))
         .route("/drafts", get(drafts_page))
-        .route("/drafts/{id}", get(show_draft))
         .route("/dictations/{id}", get(show_dictation))
         .route("/search", get(search))
-        .route("/drafts/new", post(new_draft_page))
         .route("/api/drafts", post(create_draft))
         .route("/api/drafts/{id}", put(update_draft).delete(delete_draft))
         .route("/api/drafts/{id}/save", post(save_draft))

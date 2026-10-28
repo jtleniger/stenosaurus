@@ -181,21 +181,23 @@ async fn wrong_password_is_rejected() {
 }
 
 #[tokio::test]
-async fn home_page_is_minimal_with_nav_record_and_search() {
+async fn home_page_has_nav_recorder_and_search() {
     let app = TestApp::new().await;
     let cookie = login(&app).await;
 
     let response = app.request("GET", "/", Some(&cookie), None, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = text(response).await;
-    assert!(body.contains("action=\"/drafts/new\""), "body: {body}");
-    assert!(body.contains(">Record<"), "body: {body}");
+    assert!(body.contains("id=\"dictate\""), "body: {body}");
+    assert!(body.contains("id=\"live\""), "body: {body}");
     assert!(body.contains("action=\"/search\""), "body: {body}");
     assert!(body.contains("href=\"/notes\""), "body: {body}");
     assert!(body.contains("href=\"/drafts\""), "body: {body}");
+    assert!(body.contains("alice"), "body: {body}");
     assert!(body.contains("action=\"/logout\""), "body: {body}");
     assert!(body.contains("/static/app.js"), "body: {body}");
-    assert!(!body.contains("id=\"live\""), "body: {body}");
+    assert!(!body.contains("No notes yet"), "body: {body}");
+    assert!(!body.contains("No drafts yet"), "body: {body}");
 }
 
 #[tokio::test]
@@ -259,7 +261,7 @@ async fn drafts_autosave_without_creating_notes_or_search_hits() {
     );
 
     let recorder = app
-        .request("GET", &format!("/drafts/{id}"), Some(&cookie), None, None)
+        .request("GET", &format!("/?draft={id}"), Some(&cookie), None, None)
         .await;
     assert_eq!(recorder.status(), StatusCode::OK);
     let recorder_body = text(recorder).await;
@@ -398,7 +400,7 @@ async fn discards_a_draft() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(app.store.get_draft(id).await.unwrap().is_none());
     let recorder = app
-        .request("GET", &format!("/drafts/{id}"), Some(&cookie), None, None)
+        .request("GET", &format!("/?draft={id}"), Some(&cookie), None, None)
         .await;
     assert_eq!(recorder.status(), StatusCode::NOT_FOUND);
 }
@@ -425,7 +427,7 @@ async fn multiple_drafts_are_listed_and_selectable() {
     let recorder = app
         .request(
             "GET",
-            &format!("/drafts/{first}"),
+            &format!("/?draft={first}"),
             Some(&cookie),
             None,
             None,
@@ -444,7 +446,7 @@ async fn multiple_drafts_are_listed_and_selectable() {
     assert!(drafts_body.contains("First"), "body: {drafts_body}");
     assert!(drafts_body.contains("Second"), "body: {drafts_body}");
     assert!(
-        drafts_body.contains(&format!("/drafts/{second}")),
+        drafts_body.contains(&format!("/?draft={second}")),
         "body: {drafts_body}"
     );
 
@@ -465,22 +467,9 @@ async fn unknown_draft_endpoints_are_404() {
         .await;
     assert_eq!(delete.status(), StatusCode::NOT_FOUND);
     let recorder = app
-        .request("GET", "/drafts/999", Some(&cookie), None, None)
+        .request("GET", "/?draft=999", Some(&cookie), None, None)
         .await;
     assert_eq!(recorder.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn new_draft_form_creates_and_redirects() {
-    let app = TestApp::new().await;
-    let cookie = login(&app).await;
-    let response = app
-        .request("POST", "/drafts/new", Some(&cookie), None, None)
-        .await;
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    let location = response.headers()[header::LOCATION].to_str().unwrap();
-    assert!(location.starts_with("/drafts/"), "location: {location}");
-    assert_eq!(app.store.list_drafts().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

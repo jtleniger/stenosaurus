@@ -167,14 +167,32 @@ a:hover {
   align-items: center;
   gap: 0.9rem;
   flex: none;
+  margin-left: auto;
 }
 
 .nav-links a {
   text-decoration: none;
 }
 
-.nav-links form {
+.nav .who {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+  flex: none;
+}
+
+.nav .who .muted {
+  min-width: 0;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav .who form {
   margin: 0;
+  flex: none;
 }
 
 button {
@@ -226,23 +244,6 @@ button.link:hover {
 }
 
 /* Recorder */
-
-.record-form {
-  margin: 0;
-}
-
-.record-form .record {
-  width: 100%;
-  padding: 1.1rem;
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
-}
-
-.record-form .record:hover {
-  background: var(--accent-hi);
-  border-color: var(--accent-hi);
-}
 
 .recorder {
   text-align: center;
